@@ -133,6 +133,7 @@ async function gitCommit(pi: ExtensionAPI, cwd: string, msg: string): Promise<st
 
 async function gitRevert(pi: ExtensionAPI, cwd: string): Promise<string> {
   try {
+    await pi.exec("git", ["reset", "HEAD"], { cwd, timeout: 10000 });
     await pi.exec("git", ["checkout", "--", "."], { cwd, timeout: 10000 });
     await pi.exec("git", ["clean", "-fd"], { cwd, timeout: 10000 });
     return "📝 Git: reverted changes";
