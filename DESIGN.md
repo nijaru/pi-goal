@@ -59,8 +59,9 @@ await evaluate_goal({
   reasoning: "Verified via npm test and npm run lint",
 });
 
-// Adversarial mode — sends skeptical evaluation request
-await evaluate_goal({ mode: "adversarial" });
+// Adversarial mode — returns prompt for subagent with fresh context
+const result = await evaluate_goal({ mode: "adversarial" });
+// Agent spawns subagent with result.prompt for objective evaluation
 ```
 
 ### Keep/revert
@@ -181,8 +182,10 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 - ~700 lines, single file
 - Git-native keep/revert (commit on kept, checkout on reverted)
 - Cost in USD (self-reported by agent, not automatic token counting)
+- Evaluator: adversarial mode uses subagent with fresh context window (avoids self-evaluation bias)
 - Hooks via pi's bash tool (beforeEach/afterEach)
 - Dashboard via pi's widget
 - Convergence: blocked audit (3 consecutive same-blocker turns)
-- Evaluation: completion audit in continuation template (adversarial-by-design)
+- Evaluation: completion audit uses subagent with fresh context window (avoids self-evaluation bias)
+- Completion: widget auto-clears 10s after goal marked complete (gives agent time to report final results)
 - Influenced by Codex CLI, Claude Code, Karpathy autoresearch

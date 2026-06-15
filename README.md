@@ -102,13 +102,13 @@ create_goal({
 The `evaluate_goal` tool supports two modes:
 
 - **Self mode** (default): The agent evaluates its own progress. Cheap and fast, but has self-preference bias. Works well for goals with concrete evidence (tests pass, build succeeds).
-- **Adversarial mode**: Sends the goal and recent evidence to the agent with a skeptical prompt. The agent must argue against completion, citing specific evidence for each requirement. Better for subjective goals or when extra confidence is needed.
+- **Adversarial mode**: Returns a prompt for a subagent with a fresh context window. The subagent evaluates from a skeptical perspective, arguing against completion and citing specific evidence. Fresh context avoids self-evaluation bias — agents judge their own work more favorably.
 
 Use adversarial mode for goals like "refactor for clarity" or "improve code quality." For goals with objective metrics, hooks (`afterEach`) or self mode are sufficient.
 
 ## How It Works
 
-**Completion audit** — The continuation prompt forces the agent to verify every requirement against actual state before marking complete. This is adversarial-by-design: the agent must prove completion, not just claim it.
+**Completion audit** — The continuation prompt requires the agent to spawn a subagent with a fresh context window for objective evaluation. Self-evaluation is biased (Anthropic confirmed: agents judge their own work more favorably), so the evaluator must be a separate context. The agent can only mark complete after the evaluator confirms 'achieved'.
 
 **Blocked audit** — After 3 consecutive turns of the same blocker, the goal is marked blocked. Different blockers reset the counter. Resuming a blocked goal starts a fresh audit.
 

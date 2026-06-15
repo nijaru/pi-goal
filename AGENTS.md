@@ -30,7 +30,7 @@ bun test
 
 ## Key Patterns
 
-- Completion audit: built into continuation template (adversarial-by-design)
+- Completion audit: subagent with fresh context window (avoids self-evaluation bias)
 - Blocked audit: 3 consecutive turns of same blocker before marking blocked
 - Agent-set goals: create_goal tool enables meta-prompting
 - Git-native: commit on keep, reset on revert

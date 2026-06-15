@@ -77,6 +77,7 @@ interface Runtime {
   autoTurns: number;
   timer: ReturnType<typeof setTimeout> | null;
   pendingMsg: string | null;
+  clearTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,18 +207,17 @@ Fidelity:
 - Do not substitute a narrower, safer, smaller, merely compatible, or easier-to-test solution because it is more likely to pass current tests.
 - An edit is aligned only if it makes the requested final state more true; useful-looking behavior that preserves a different end state is misaligned.
 
-Completion audit:
-Before deciding that the goal is achieved, treat completion as unproven and verify it against the actual current state:
-- Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.
-- Preserve the original scope; do not redefine success around the work that already exists.
-- For every explicit requirement, numbered item, named artifact, command, test, gate, invariant, and deliverable, identify the authoritative evidence that would prove it, then inspect the relevant current-state sources: files, command output, test results, rendered artifacts, runtime behavior, or other authoritative evidence.
-- For each item, determine whether the evidence proves completion, contradicts completion, shows incomplete work, is too weak or indirect to verify completion, or is missing.
-- Match the verification scope to the requirement's scope; do not use a narrow check to support a broad claim.
-- Treat tests, manifests, verifiers, green checks, and search results as evidence only after confirming they cover the relevant requirement.
-- Treat uncertain or indirect evidence as not achieved; gather stronger evidence or continue the work.
-- The audit must prove completion, not merely fail to find obvious remaining work.
+Completion audit (use a subagent for fresh-context evaluation):
+Before deciding that the goal is achieved, verify it against the actual current state. Self-evaluation is biased — agents judge their own work more favorably. Use evaluate_goal with mode 'adversarial' to spawn a subagent with a fresh context window for objective assessment.
+The audit process:
+1. Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.
+2. Preserve the original scope; do not redefine success around the work that already exists.
+3. For every explicit requirement, gather authoritative evidence: files, command output, test results, rendered artifacts, runtime behavior.
+4. When all requirements appear met, call evaluate_goal with mode 'adversarial'. This returns a prompt to spawn a subagent with a fresh context window.
+5. The subagent evaluates from a skeptical perspective — only mark 'achieved' if it confirms completion with specific evidence.
+6. Only after the adversarial evaluator confirms 'achieved' may you call update_goal with status 'complete'.
 
-Do not rely on intent, partial progress, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when current evidence proves every requirement has been satisfied and no required work remains. If the evidence is incomplete, weak, indirect, merely consistent with completion, or leaves any requirement missing, incomplete, or unverified, keep working instead of marking the goal complete.
+Do not self-assess completion. The fresh-context evaluator corrects for self-preferential bias. If the evaluator returns 'not_yet', continue working.
 
 Blocked audit:
 - Do not call update_goal with status "blocked" the first time a blocker appears.
@@ -283,7 +283,7 @@ const LogIdeaParams = Type.Object({
 // ---------------------------------------------------------------------------
 
 export default function piGoal(pi: ExtensionAPI) {
-  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null };
+  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null, clearTimer: undefined };
 
   // -- Persistence --
 
@@ -420,6 +420,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
       rt.goal = goal;
       rt.autoTurns = 0;
+      if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
 
       const p = goalPaths(ctx.cwd, id);
       fs.mkdirSync(p.dir, { recursive: true });
@@ -487,6 +488,7 @@ export default function piGoal(pi: ExtensionAPI) {
       if (params.status === "cleared") {
         if (!rt.goal) return err("❌ No goal to clear.");
         cancelResume();
+        if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
         rt.goal = null;
         rt.autoTurns = 0;
         updateWidget(ctx);
@@ -521,12 +523,22 @@ export default function piGoal(pi: ExtensionAPI) {
         save(ctx.cwd);
         cancelResume();
         updateWidget(ctx);
+        // Auto-clear widget after delay so agent can report final results
+        if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
+        rt.clearTimer = setTimeout(() => {
+          if (rt.goal?.status === "complete") {
+            rt.goal = null; rt.autoTurns = 0;
+            if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
+          }
+          rt.clearTimer = undefined;
+        }, 10_000);
         return ok([
           `🎉 Goal complete`,
           `Objective: ${g.objective}`,
           `Iterations: ${g.iterations.length} | Cost: ${fmt$(g.costUsed)}`,
           "",
           "Report final usage to the user: iterations completed, total cost, and time spent.",
+          "Then clear the goal: update_goal({ status: 'cleared' })",
         ].join("\n"), { goal: g });
       }
 
@@ -576,12 +588,13 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "evaluate_goal",
     label: "Evaluate Goal",
-    description: "Optional goal evaluation. Self mode (default) uses the agent's own assessment. Adversarial mode sends a skeptical evaluation request for subjective goals.",
+    description: "Optional goal evaluation. Self mode (default) uses the agent's own assessment. Adversarial mode returns a prompt for a subagent with a fresh context window to evaluate objectively.",
     promptSnippet: "Evaluate goal progress (self or adversarial)",
     promptGuidelines: [
       "Optional — the continuation prompt already includes a completion audit.",
       "Use for extra confidence when the stakes are high or the objective is ambiguous.",
-      "evaluate_goal with mode 'adversarial' sends a skeptical evaluation request. Use for subjective goals.",
+      "evaluate_goal with mode 'adversarial' returns a prompt. Spawn a subagent with that prompt for fresh-context evaluation.",
+      "Call after each attempt to record what you tried.",
     ],
     parameters: EvaluateGoalParams,
 
@@ -616,19 +629,21 @@ export default function piGoal(pi: ExtensionAPI) {
         ].join("\n"), { goal: g, verdict: "not_yet" });
       }
 
-      // Adversarial mode — send skeptical evaluation request
-      const recent = g.iterations.slice(-3);
+      // Adversarial mode — build prompt for fresh-context subagent evaluation
+      const recent = g.iterations.slice(-5);
       const prompt = [
         "You are performing an adversarial evaluation of a goal. Be skeptical. Your job is to find problems, not confirm success.",
         "",
         `Goal: ${g.objective}`,
+        `Budget used: ${fmt$(g.costUsed)} / ${fmt$(g.budget)}`,
+        `Iterations: ${g.iterations.length}`,
         "",
         "Recent iterations:",
-        ...recent.map(it => `- [${it.status}] ${it.hypothesis} → ${it.result}`),
+        ...recent.map(it => `- [${it.status}] Iter ${it.n}: ${it.hypothesis} → ${it.result}`),
         "",
         "Your task:",
         "1. Derive concrete, verifiable requirements from the goal",
-        "2. For each requirement, check if the evidence proves it is met",
+        "2. For each requirement, check if the iteration evidence proves it is met",
         "3. Look for gaps, weak evidence, incomplete work, or overlooked requirements",
         "4. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
         "",
@@ -640,14 +655,14 @@ export default function piGoal(pi: ExtensionAPI) {
         "- reasoning: cite specific evidence for each requirement",
       ].join("\n");
 
-      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-
       return ok([
-        "⏳ Adversarial evaluation requested.",
-        "The agent will evaluate from a skeptical perspective in the next turn.",
+        "⏳ Adversarial evaluation prompt ready.",
         "",
-        `Goal: ${g.objective}`,
-        `Budget: ${fmt$(g.costUsed)} / ${fmt$(g.budget)}`,
+        "Spawn a subagent with this evaluation prompt to get a fresh-context assessment:",
+        "",
+        prompt,
+        "",
+        "If the subagent confirms 'achieved', call update_goal with status 'complete'.",
       ].join("\n"), { goal: g, mode: "adversarial" });
     },
 
@@ -825,7 +840,7 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       if (cmd === "clear") {
-        cancelResume(); rt.goal = null; rt.autoTurns = 0;
+        cancelResume(); if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; } rt.goal = null; rt.autoTurns = 0;
         if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
         ctx.ui.notify("Cleared", "info");
         return;
