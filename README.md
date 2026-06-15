@@ -20,7 +20,7 @@ pi install git:github.com/nijaru/pi-goal
 /goal all tests pass and lint is clean
 ```
 
-The agent creates a goal, works autonomously, and repeats until complete, blocked, or budget-exhausted. The loop continues across turns — no manual prompting needed.
+The agent creates a goal, works autonomously, and repeats until complete, blocked, or budget-limited. The loop continues across turns — no manual prompting needed.
 
 ### Commands
 
@@ -63,7 +63,7 @@ paused → active         (/goal resume)
 
 **Ideas backlog** — Promising-but-untried approaches are logged to prevent random walk.
 
-**Iteration journal** — Every attempt is recorded in `.pi/goal/<id>/journal.md` with hypothesis, result, cost, and commit hash.
+**Iteration journal** — Every logged attempt is recorded in `.pi/goal/<id>/journal.md` with hypothesis, result, cost, and commit hash.
 
 ## Hooks
 
