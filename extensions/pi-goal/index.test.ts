@@ -324,7 +324,7 @@ describe("pi-goal extension", () => {
 
     // Resume
     await goalCmd.handler("resume", ctx);
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Resumed", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Resumed — fresh blocked audit", "info");
   });
 
   test("/goal clear removes goal", async () => {
@@ -372,5 +372,30 @@ describe("pi-goal extension", () => {
     const ctx = createMockCtx();
     await goalCmd.handler("pause", ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith("No active goal", "warning");
+  });
+
+  test("/goal resume resets blocked counter", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const updateGoal = pi.getTool("update_goal");
+    const goalCmd = pi.getCommand("goal");
+    const getGoal = pi.getTool("get_goal");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+
+    // Bump blocked count
+    await updateGoal.execute("c2", { status: "blocked", blocker: "x" }, undefined, undefined, ctx);
+    await updateGoal.execute("c3", { status: "blocked", blocker: "x" }, undefined, undefined, ctx);
+
+    // Pause and resume
+    await goalCmd.handler("pause", ctx);
+    await goalCmd.handler("resume", ctx);
+
+    // Blocked count should be reset
+    const state = await getGoal.execute("c4", {}, undefined, undefined, ctx);
+    expect(state.content[0].text).not.toContain("Blocked");
   });
 });
