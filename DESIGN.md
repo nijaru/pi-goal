@@ -187,5 +187,5 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 - Dashboard via pi's widget
 - Convergence: blocked audit (3 consecutive same-blocker turns)
 - Evaluation: completion audit requires fresh context (subagent or fresh turn) to avoid self-evaluation bias
-- Completion: widget stays visible until user creates a new goal or clears it
+- Completion: widget stays visible for 3 turns after terminal state, then auto-clears
 - Influenced by Codex CLI, Claude Code, Karpathy autoresearch

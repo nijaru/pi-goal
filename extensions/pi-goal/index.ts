@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 const GOAL_DIR = ".pi/goal";
 const MAX_AUTO_CONTINUE = 50;
 const BLOCKED_THRESHOLD = 3; // consecutive turns before marking blocked
+const TERMINAL_TURNS = 3; // auto-clear widget after this many turns in terminal state
 const SETTLED_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ interface Runtime {
   autoTurns: number;
   timer: ReturnType<typeof setTimeout> | null;
   pendingMsg: string | null;
+  terminalTurns: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +284,7 @@ const LogIdeaParams = Type.Object({
 // ---------------------------------------------------------------------------
 
 export default function piGoal(pi: ExtensionAPI) {
-  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null };
+  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null, terminalTurns: 0 };
 
   // -- Persistence --
 
@@ -363,7 +365,21 @@ export default function piGoal(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     const g = rt.goal;
-    if (!g || g.status !== "active") return;
+    if (!g) return;
+
+    // Terminal state: count turns and auto-clear after threshold
+    if (g.status === "complete" || g.status === "blocked" || g.status === "budget_limited") {
+      rt.terminalTurns++;
+      if (rt.terminalTurns >= TERMINAL_TURNS) {
+        rt.goal = null;
+        rt.terminalTurns = 0;
+        if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
+      }
+      return;
+    }
+
+    if (g.status !== "active") return;
+    rt.terminalTurns = 0;
     const ideasPath = goalPaths(ctx.cwd, g.id).ideas;
     return {
       systemPrompt: event.systemPrompt + [
@@ -419,6 +435,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
       rt.goal = goal;
       rt.autoTurns = 0;
+      rt.terminalTurns = 0;
 
       const p = goalPaths(ctx.cwd, id);
       fs.mkdirSync(p.dir, { recursive: true });
@@ -488,6 +505,7 @@ export default function piGoal(pi: ExtensionAPI) {
         cancelResume();
         rt.goal = null;
         rt.autoTurns = 0;
+        rt.terminalTurns = 0;
         updateWidget(ctx);
         return ok("🗑️ Goal cleared. You can now create a new one with create_goal.", {});
       }
@@ -828,7 +846,7 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       if (cmd === "clear") {
-        cancelResume(); rt.goal = null; rt.autoTurns = 0;
+        cancelResume(); rt.goal = null; rt.autoTurns = 0; rt.terminalTurns = 0;
         if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
         ctx.ui.notify("Cleared", "info");
         return;

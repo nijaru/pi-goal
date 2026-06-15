@@ -260,6 +260,63 @@ describe("pi-goal extension", () => {
     expect(result.content[0].text).toContain("No active goal");
   });
 
+  test("evaluate_goal self mode returns verdict", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const evaluateGoal = pi.getTool("evaluate_goal");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "tests pass", budget: 5 }, undefined, undefined, ctx);
+
+    const r = await evaluateGoal.execute("c2", { mode: "self", analysis: "All tests pass", verdict: "achieved", reasoning: "Verified via bun test" }, undefined, undefined, ctx);
+    expect(r.content[0].text).toContain("achieved");
+    expect(r.content[0].text).toContain("update_goal with status 'complete'");
+  });
+
+  test("evaluate_goal adversarial returns prompt for subagent", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const evaluateGoal = pi.getTool("evaluate_goal");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "tests pass", budget: 5 }, undefined, undefined, ctx);
+
+    const r = await evaluateGoal.execute("c2", { mode: "adversarial" }, undefined, undefined, ctx);
+    expect(r.content[0].text).toContain("subagent");
+    expect(r.content[0].text).toContain("followUp");
+    expect(r.content[0].text).toContain("tests pass");
+    expect(r.details.mode).toBe("adversarial");
+  });
+
+  test("before_agent_start auto-clears terminal goal after threshold", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const updateGoal = pi.getTool("update_goal");
+    const ctx = createMockCtx();
+    ctx.hasUI = true;
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+    await updateGoal.execute("c2", { status: "complete" }, undefined, undefined, ctx);
+
+    // Reset mock to clear calls from setup
+    ctx.ui.setWidget.mockClear();
+
+    const handler = pi.handlers.get("before_agent_start");
+    // Simulate TERMINAL_TURNS (3) agent starts
+    handler({ systemPrompt: "" }, ctx);
+    handler({ systemPrompt: "" }, ctx);
+    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+
+    handler({ systemPrompt: "" }, ctx);
+    expect(ctx.ui.setWidget).toHaveBeenCalledWith("goal", undefined);
+  });
+
   test("log_idea returns error when no goal", async () => {
     const mod = await import("./index.ts");
     const pi = createMockAPI();
