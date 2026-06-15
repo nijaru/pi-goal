@@ -582,7 +582,6 @@ export default function piGoal(pi: ExtensionAPI) {
       "Optional — the continuation prompt already includes a completion audit.",
       "Use for extra confidence when the stakes are high or the objective is ambiguous.",
       "evaluate_goal with mode 'adversarial' returns a prompt. Spawn a subagent with that prompt (preferred) or send as followUp message (fallback) for fresh-context evaluation.",
-      "Call after each attempt to record what you tried.",
     ],
     parameters: EvaluateGoalParams,
 
