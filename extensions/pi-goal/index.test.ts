@@ -203,6 +203,51 @@ describe("pi-goal extension", () => {
     expect(r.content[0].text).toContain("Goal is complete");
   });
 
+  test("update_goal pauses goal", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const updateGoal = pi.getTool("update_goal");
+    const getGoal = pi.getTool("get_goal");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+    const r = await updateGoal.execute("c2", { status: "paused" }, undefined, undefined, ctx);
+    expect(r.content[0].text).toContain("Goal paused");
+
+    const state = await getGoal.execute("c3", {}, undefined, undefined, ctx);
+    expect(state.content[0].text).toContain("paused");
+  });
+
+  test("update_goal clears goal", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const updateGoal = pi.getTool("update_goal");
+    const getGoal = pi.getTool("get_goal");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+    const r = await updateGoal.execute("c2", { status: "cleared" }, undefined, undefined, ctx);
+    expect(r.content[0].text).toContain("Goal cleared");
+
+    const state = await getGoal.execute("c3", {}, undefined, undefined, ctx);
+    expect(state.content[0].text).toContain("No active goal");
+  });
+
+  test("update_goal cleared works when no goal", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const updateGoal = pi.getTool("update_goal");
+    const ctx = createMockCtx();
+    const r = await updateGoal.execute("c1", { status: "cleared" }, undefined, undefined, ctx);
+    expect(r.content[0].text).toContain("No goal to clear");
+  });
+
   test("evaluate_goal returns error when no goal", async () => {
     const mod = await import("./index.ts");
     const pi = createMockAPI();

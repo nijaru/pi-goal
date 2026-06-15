@@ -148,7 +148,7 @@ function requireGoal(g: GoalState | null): string | null {
 }
 function requireActive(g: GoalState | null): string | null {
   if (!g) return "❌ No active goal. Call create_goal first.";
-  if (g.status !== "active") return `❌ Goal is ${g.status}. Use /goal resume to continue.`;
+  if (g.status !== "active") return `❌ Goal is ${g.status}. Call update_goal with status "cleared" to clear it, or resume via the /goal command.`;
   return null;
 }
 
@@ -248,8 +248,8 @@ const CreateGoalParams = Type.Object({
 });
 
 const UpdateGoalParams = Type.Object({
-  status: StringEnum(["complete", "blocked"] as const, {
-    description: "Set to 'complete' only when the objective is achieved and verified. Set to 'blocked' only after the same blocker has persisted for 3+ consecutive turns.",
+  status: StringEnum(["complete", "blocked", "paused", "cleared"] as const, {
+    description: "Set to 'complete' when the objective is achieved and verified. Set to 'blocked' after the same blocker has persisted for 3+ consecutive turns. Set to 'paused' to suspend the goal loop. Set to 'cleared' to abandon the goal entirely.",
   }),
   blocker: Type.Optional(Type.String({
     description: "Description of the blocker (required when status is 'blocked'). Must be the same description across consecutive calls to trigger the blocked threshold.",
@@ -387,13 +387,13 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
-    description: "Create a persistent goal with an objective and budget. Only when explicitly requested by the user; do not infer goals from ordinary tasks. Fails if an unfinished goal exists — use update_goal for status.",
-    promptSnippet: "Create a goal to pursue",
+    description: "Create a persistent goal that tracks across turns. The agent works toward the objective autonomously, logging iterations and evaluating progress. Fails if an active goal exists — use update_goal to clear it first.",
+    promptSnippet: "Create a persistent goal to pursue autonomously",
     promptGuidelines: [
-      "Call create_goal when the user explicitly requests a goal or when you should set one for yourself or a subagent.",
+      "Call create_goal when the user explicitly requests a goal or when you should set one for yourself.",
       "Do not infer goals from ordinary tasks. Only create a goal when the user asks for one.",
       "Objective should be specific and verifiable. Budget is required (USD).",
-      "Fails if an unfinished goal exists. Use update_goal to mark complete or blocked.",
+      "Fails if an active goal exists. Use update_goal with status 'cleared' to remove it first.",
     ],
     parameters: CreateGoalParams,
 
@@ -441,8 +441,8 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_goal",
     label: "Get Goal",
-    description: "Get the current goal state, including status, budget, iterations, and recent history.",
-    promptSnippet: "Read current goal state",
+    description: "Get the current goal state: objective, status, budget used/remaining, iteration count, and recent iteration history.",
+    promptSnippet: "Check current goal status and progress",
     parameters: Type.Object({}),
 
     async execute() {
@@ -468,11 +468,13 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "update_goal",
     label: "Update Goal",
-    description: `Mark the goal complete (after passing completion audit) or blocked (after ${BLOCKED_THRESHOLD}+ turns of same blocker). Once the blocked threshold is satisfied, set status to blocked — do not keep reporting blocked while leaving the goal active.`,
-    promptSnippet: "Mark goal complete or blocked",
+    description: `Manage goal lifecycle. Set to 'complete' after passing completion audit. Set to 'blocked' after ${BLOCKED_THRESHOLD}+ turns of same blocker. Set to 'paused' to suspend the goal loop. Set to 'cleared' to abandon the goal entirely.`,
+    promptSnippet: "Update goal status (complete, blocked, paused, cleared)",
     promptGuidelines: [
       'Set status to "complete" only when the objective is achieved and verified against actual state.',
       `Set status to "blocked" only after the same blocker has persisted for ${BLOCKED_THRESHOLD}+ consecutive turns.`,
+      'Set status to "paused" to suspend the goal loop (e.g., waiting for user input, switching focus).',
+      'Set status to "cleared" to abandon the goal entirely and free up for a new one.',
       'After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit.',
       'Once the blocked threshold is satisfied, do not keep reporting blocked while leaving the goal active — set status to "blocked".',
       'Do not use blocked merely because the work is hard, slow, uncertain, or would benefit from clarification.',
@@ -481,6 +483,34 @@ export default function piGoal(pi: ExtensionAPI) {
     parameters: UpdateGoalParams,
 
     async execute(_id, params, _sig, _upd, ctx) {
+      // paused and cleared don't require active goal
+      if (params.status === "cleared") {
+        if (!rt.goal) return err("❌ No goal to clear.");
+        cancelResume();
+        rt.goal = null;
+        rt.autoTurns = 0;
+        updateWidget(ctx);
+        return ok("🗑️ Goal cleared. You can now create a new one with create_goal.", {});
+      }
+
+      if (params.status === "paused") {
+        const check = requireActive(rt.goal);
+        if (check) return err(check);
+        const g = rt.goal!;
+        g.status = "paused";
+        g.updatedAt = now();
+        save(ctx.cwd);
+        cancelResume();
+        updateWidget(ctx);
+        return ok([
+          `⏸ Goal paused`,
+          `Objective: ${g.objective}`,
+          `Iterations: ${g.iterations.length} | Cost: ${fmt$(g.costUsed)} / ${fmt$(g.budget)}`,
+          "",
+          "Resume via the /goal command when ready to continue.",
+        ].join("\n"), { goal: g });
+      }
+
       const check = requireActive(rt.goal);
       if (check) return err(check);
       const g = rt.goal!;
@@ -531,7 +561,7 @@ export default function piGoal(pi: ExtensionAPI) {
         `⊘ Goal blocked after ${g.blockedCount} turns of the same blocker`,
         `Objective: ${g.objective}`,
         `Blocker: ${blocker}`,
-        "Use /goal resume to retry or /goal clear to stop.",
+        "Use /goal command to resume, or update_goal with status \"cleared\" to abandon.",
       ].join("\n"), { goal: g });
     },
 
