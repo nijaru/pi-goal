@@ -1,0 +1,7 @@
+node_modules
+bun.lock
+ai/
+review.md
+.git
+.github
+.pi
