@@ -24,7 +24,7 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 - `create_goal` — set objective + budget (agent or user)
 - `get_goal` — read current goal state
 - `update_goal` — mark complete or blocked
-- `evaluate_goal` — optional adversarial second opinion
+- `evaluate_goal` — optional evaluation (self or adversarial)
 - `log_iteration` — record iteration, git commit/revert
 - `log_idea` — ideas backlog (anti-random-walk)
 

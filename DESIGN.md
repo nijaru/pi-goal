@@ -51,12 +51,16 @@ await log_iteration({
 The continuation template includes a completion audit (adversarial-by-design). For extra confidence, use evaluate_goal:
 
 ```js
-// Optional second opinion
+// Self mode — agent evaluates its own progress
 await evaluate_goal({
+  mode: "self",
   analysis: "All 47 auth tests pass, lint is clean",
   verdict: "achieved",
   reasoning: "Verified via npm test and npm run lint",
 });
+
+// Adversarial mode — sends skeptical evaluation request
+await evaluate_goal({ mode: "adversarial" });
 ```
 
 ### Keep/revert
@@ -145,7 +149,7 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 | create_goal | Agent/user | Sets objective + budget |
 | get_goal | Read-only | Check state |
 | update_goal | Agent | After completion audit |
-| evaluate_goal | Optional | Adversarial second opinion |
+| evaluate_goal | Optional | Self or adversarial evaluation |
 | log_iteration | Agent | Git commit/revert |
 | log_idea | Agent | Anti-random-walk |
 

@@ -11,7 +11,7 @@
  * pi-goal additions:
  * - `log_iteration` — record iteration, git commit/revert
  * - `log_idea` — ideas backlog (anti-random-walk)
- * - `evaluate_goal` — optional adversarial second opinion
+ * - `evaluate_goal` — optional evaluation (self or adversarial)
  *
  * Continuation template includes completion audit (adversarial-by-design).
  */
@@ -541,7 +541,7 @@ export default function piGoal(pi: ExtensionAPI) {
     renderResult(r, _, theme) { return new Text(r.content[0]?.type === "text" ? r.content[0].text : "", 0, 0); },
   });
 
-  // -- pi-goal Addition: evaluate_goal (optional adversarial second opinion) --
+  // -- pi-goal Addition: evaluate_goal (self or adversarial evaluation) --
 
   pi.registerTool({
     name: "evaluate_goal",
