@@ -546,8 +546,8 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "evaluate_goal",
     label: "Evaluate Goal",
-    description: "Optional adversarial second opinion — a different perspective verifies if the objective is met. Use alongside the built-in completion audit.",
-    promptSnippet: "Adversarial second opinion on goal progress",
+    description: "Optional goal evaluation. Self mode (default) uses the agent's own assessment. Adversarial mode sends a skeptical evaluation request for subjective goals.",
+    promptSnippet: "Evaluate goal progress (self or adversarial)",
     promptGuidelines: [
       "Optional — the continuation prompt already includes a completion audit.",
       "Use for extra confidence when the stakes are high or the objective is ambiguous.",
