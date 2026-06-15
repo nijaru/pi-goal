@@ -182,10 +182,10 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 - ~700 lines, single file
 - Git-native keep/revert (commit on kept, checkout on reverted)
 - Cost in USD (self-reported by agent, not automatic token counting)
-- Evaluator: adversarial mode uses subagent with fresh context window (avoids self-evaluation bias)
+- Evaluator: adversarial mode uses fresh context (subagent preferred, fresh turn fallback) to avoid self-evaluation bias
 - Hooks via pi's bash tool (beforeEach/afterEach)
 - Dashboard via pi's widget
 - Convergence: blocked audit (3 consecutive same-blocker turns)
-- Evaluation: completion audit uses subagent with fresh context window (avoids self-evaluation bias)
-- Completion: widget auto-clears 10s after goal marked complete (gives agent time to report final results)
+- Evaluation: completion audit requires fresh context (subagent or fresh turn) to avoid self-evaluation bias
+- Completion: widget stays visible until user creates a new goal or clears it
 - Influenced by Codex CLI, Claude Code, Karpathy autoresearch

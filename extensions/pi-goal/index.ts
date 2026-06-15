@@ -77,7 +77,6 @@ interface Runtime {
   autoTurns: number;
   timer: ReturnType<typeof setTimeout> | null;
   pendingMsg: string | null;
-  clearTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +206,17 @@ Fidelity:
 - Do not substitute a narrower, safer, smaller, merely compatible, or easier-to-test solution because it is more likely to pass current tests.
 - An edit is aligned only if it makes the requested final state more true; useful-looking behavior that preserves a different end state is misaligned.
 
-Completion audit (use a subagent for fresh-context evaluation):
-Before deciding that the goal is achieved, verify it against the actual current state. Self-evaluation is biased — agents judge their own work more favorably. Use evaluate_goal with mode 'adversarial' to spawn a subagent with a fresh context window for objective assessment.
+Completion audit (evaluate in a fresh context, not inline):
+Before deciding that the goal is achieved, verify it against the actual current state. Self-evaluation is biased — agents judge their own work more favorably. Evaluate in a fresh context to correct for this.
 The audit process:
 1. Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.
 2. Preserve the original scope; do not redefine success around the work that already exists.
 3. For every explicit requirement, gather authoritative evidence: files, command output, test results, rendered artifacts, runtime behavior.
-4. When all requirements appear met, call evaluate_goal with mode 'adversarial'. This returns a prompt to spawn a subagent with a fresh context window.
-5. The subagent evaluates from a skeptical perspective — only mark 'achieved' if it confirms completion with specific evidence.
-6. Only after the adversarial evaluator confirms 'achieved' may you call update_goal with status 'complete'.
+4. When all requirements appear met, call evaluate_goal with mode 'adversarial'. This returns an evaluation prompt.
+5. Preferred: spawn a subagent with the prompt for a fresh-context evaluation. Fallback: send the prompt as a followUp message for evaluation in a fresh turn.
+6. Only after the evaluator confirms 'achieved' may you call update_goal with status 'complete'.
 
-Do not self-assess completion. The fresh-context evaluator corrects for self-preferential bias. If the evaluator returns 'not_yet', continue working.
+Do not self-assess completion inline. Fresh context (subagent or fresh turn) corrects for self-preferential bias. If the evaluator returns 'not_yet', continue working.
 
 Blocked audit:
 - Do not call update_goal with status "blocked" the first time a blocker appears.
@@ -283,7 +282,7 @@ const LogIdeaParams = Type.Object({
 // ---------------------------------------------------------------------------
 
 export default function piGoal(pi: ExtensionAPI) {
-  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null, clearTimer: undefined };
+  const rt: Runtime = { goal: null, autoTurns: 0, timer: null, pendingMsg: null };
 
   // -- Persistence --
 
@@ -420,7 +419,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
       rt.goal = goal;
       rt.autoTurns = 0;
-      if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
 
       const p = goalPaths(ctx.cwd, id);
       fs.mkdirSync(p.dir, { recursive: true });
@@ -488,7 +486,6 @@ export default function piGoal(pi: ExtensionAPI) {
       if (params.status === "cleared") {
         if (!rt.goal) return err("❌ No goal to clear.");
         cancelResume();
-        if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
         rt.goal = null;
         rt.autoTurns = 0;
         updateWidget(ctx);
@@ -523,22 +520,13 @@ export default function piGoal(pi: ExtensionAPI) {
         save(ctx.cwd);
         cancelResume();
         updateWidget(ctx);
-        // Auto-clear widget after delay so agent can report final results
-        if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; }
-        rt.clearTimer = setTimeout(() => {
-          if (rt.goal?.status === "complete") {
-            rt.goal = null; rt.autoTurns = 0;
-            if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
-          }
-          rt.clearTimer = undefined;
-        }, 10_000);
         return ok([
           `🎉 Goal complete`,
           `Objective: ${g.objective}`,
           `Iterations: ${g.iterations.length} | Cost: ${fmt$(g.costUsed)}`,
           "",
           "Report final usage to the user: iterations completed, total cost, and time spent.",
-          "Then clear the goal: update_goal({ status: 'cleared' })",
+          "The goal display stays visible until the user creates a new goal or clears it.",
         ].join("\n"), { goal: g });
       }
 
@@ -588,12 +576,12 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "evaluate_goal",
     label: "Evaluate Goal",
-    description: "Optional goal evaluation. Self mode (default) uses the agent's own assessment. Adversarial mode returns a prompt for a subagent with a fresh context window to evaluate objectively.",
+    description: "Optional goal evaluation. Self mode (default) uses the agent's own assessment. Adversarial mode returns a prompt for evaluation in a fresh context (subagent preferred, fresh turn as fallback).",
     promptSnippet: "Evaluate goal progress (self or adversarial)",
     promptGuidelines: [
       "Optional — the continuation prompt already includes a completion audit.",
       "Use for extra confidence when the stakes are high or the objective is ambiguous.",
-      "evaluate_goal with mode 'adversarial' returns a prompt. Spawn a subagent with that prompt for fresh-context evaluation.",
+      "evaluate_goal with mode 'adversarial' returns a prompt. Spawn a subagent with that prompt (preferred) or send as followUp message (fallback) for fresh-context evaluation.",
       "Call after each attempt to record what you tried.",
     ],
     parameters: EvaluateGoalParams,
@@ -658,11 +646,12 @@ export default function piGoal(pi: ExtensionAPI) {
       return ok([
         "⏳ Adversarial evaluation prompt ready.",
         "",
-        "Spawn a subagent with this evaluation prompt to get a fresh-context assessment:",
+        "Preferred: spawn a subagent with this evaluation prompt for a fresh-context assessment.",
+        "Fallback: if subagent is not available, send this prompt as a followUp message to evaluate in a fresh turn.",
         "",
         prompt,
         "",
-        "If the subagent confirms 'achieved', call update_goal with status 'complete'.",
+        "If the evaluator confirms 'achieved', call update_goal with status 'complete'.",
       ].join("\n"), { goal: g, mode: "adversarial" });
     },
 
@@ -840,7 +829,7 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       if (cmd === "clear") {
-        cancelResume(); if (rt.clearTimer) { clearTimeout(rt.clearTimer); rt.clearTimer = undefined; } rt.goal = null; rt.autoTurns = 0;
+        cancelResume(); rt.goal = null; rt.autoTurns = 0;
         if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
         ctx.ui.notify("Cleared", "info");
         return;
