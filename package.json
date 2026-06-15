@@ -1,0 +1,37 @@
+{
+  "name": "pi-goal",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Persistent loop for pi — define what done means, agent works until it's done.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "goal",
+    "autoresearch",
+    "autonomous",
+    "loop",
+    "optimization"
+  ],
+  "license": "MIT",
+  "author": "Nick Naru <nick@nijaru.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nijaru/pi-goal.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}
