@@ -18,54 +18,44 @@ Goal mode (Claude Code, Codex) and autoresearch (Karpathy) are the same pattern:
 
 ## API
 
-### Set a goal
+### Create a goal
 
 ```js
-// Natural language condition
-const goal = await goal({
-  name: "migrate-auth-to-paseto",
-  done: "all tests pass and lint is clean",
+// Agent creates its own goal (meta-prompting)
+const goal = await create_goal({
+  objective: "all tests pass and lint is clean",
   budget: 5.00,
 });
 
-// Numeric metric
-const goal = await goal({
-  name: "optimize-auth-latency",
-  done: "p95_latency_ms below 200",
-  budget: 5.00,
-});
-
-// Test command
-const goal = await goal({
-  name: "fix-all-failing-tests",
-  done: "npm test passes",
-  budget: 3.00,
+// Agent creates goal for a subagent
+const goal = await create_goal({
+  objective: "Fix auth module tests",
+  budget: 2.00,
 });
 ```
 
 ### Run an iteration
 
 ```js
-const iteration = await goal.run(async (ctx) => {
-  const change = await agent(`Optimize: ${ctx.hypothesis}`, {
-    taskType: "implement",
-    label: "optimizer",
-  });
-  await apply(change);
-  const metric = await measure();
-  return { metric, change };
+// Agent logs what it tried
+await log_iteration({
+  hypothesis: "Add caching layer to reduce latency",
+  result: "p95 improved from 250ms to 210ms",
+  cost: 0.03,
+  status: "kept",
 });
 ```
 
-### Evaluate
+### Evaluate (optional)
 
-Adversarial evaluation — a different model checks if the goal is met. Never self-evaluate.
+The continuation template includes a completion audit (adversarial-by-design). For extra confidence, use evaluate_goal:
 
 ```js
-// For condition-driven goals
-const evaluator = await agent("Has the goal been achieved? Check actual artifacts.", {
-  taskType: "review",
-  label: "evaluator",
+// Optional second opinion
+await evaluate_goal({
+  analysis: "All 47 auth tests pass, lint is clean",
+  verdict: "achieved",
+  reasoning: "Verified via npm test and npm run lint",
 });
 ```
 
@@ -78,34 +68,35 @@ Git-native. Commit on keep, `git reset` on revert. Each iteration is a checkpoin
 Promising-but-untried approaches logged to prevent random walk:
 
 ```js
-goal.logIdea("Try connection pooling instead of caching — current approach hit race conditions");
-const ideas = goal.getIdeas();
+await log_idea({ idea: "Try connection pooling instead of caching" });
 ```
 
 ## Goal Lifecycle
 
 ```
-pursuing → achieved    (goal met)
-pursuing → unmet       (external blocker)
-pursuing → budget_limited (token budget exhausted)
-pursuing → paused      (user action)
-paused   → pursuing    (user resumes)
+active → complete      (goal met, verified via completion audit)
+active → blocked       (same blocker for 3+ consecutive turns)
+active → budget_limited (budget exhausted)
+active → paused        (user action)
+paused → active        (user resumes)
 ```
 
 ## Convergence
 
 Stop when:
-- Goal is achieved (adversarial evaluation confirms)
+- Goal is complete (completion audit passes, agent calls update_goal)
+- Goal is blocked (3+ turns of same blocker)
 - Budget exhausted
-- No improvement for N iterations (plateau detection)
 
 ## Hooks
 
-```json
-{
-  "beforeEach": "git stash && git checkout baseline",
-  "afterEach": "npm test"
-}
+```js
+await create_goal({
+  objective: "all tests pass",
+  budget: 5.00,
+  beforeEach: "git stash && git checkout baseline",
+  afterEach: "npm test",
+});
 ```
 
 ## Iteration Log
@@ -147,22 +138,30 @@ Promising-but-untried approaches in `.pi/goal/<goal-id>/ideas.md`:
 Widget (compact): iteration count, progress, cost
 Panel (full): history, metrics, cost breakdown, hooks, ideas
 
-## Task-Type Routing
+## Tool Model
 
-Different roles get different models:
-
-| Role | Task Type | Default Tier |
-|------|-----------|--------------|
-| Optimizer | `implement` | medium |
-| Evaluator | `review` | big |
+| Tool | Role | Notes |
+|------|------|-------|
+| create_goal | Agent/user | Sets objective + budget |
+| get_goal | Read-only | Check state |
+| update_goal | Agent | After completion audit |
+| evaluate_goal | Optional | Adversarial second opinion |
+| log_iteration | Agent | Git commit/revert |
+| log_idea | Agent | Anti-random-walk |
 
 ## What This Doesn't Do
 
-- No self-evaluation — adversarial only
 - No unbounded loops — budget always required
 - No orchestration — that's pi-workflows
 - No agent definitions — that's pi-subagents
 - No separate memory extension — iteration log is built in
+
+## Influences
+
+- **Codex CLI** — completion audit, blocked audit, agent-set goals
+- **Claude Code** — external evaluator pattern
+- **Karpathy autoresearch** — git-native keep/revert, metric loop
+- **SELFGOAL** — hierarchical goal decomposition (future)
 
 ## File Structure
 
@@ -175,10 +174,11 @@ Different roles get different models:
 
 ## Implementation Notes
 
-- ~300-400 lines across a few files
-- Git-native keep/revert
-- Cost tracking from pi's token counts
-- Hooks via pi's bash tool
-- Dashboard via pi's widget/panel
-- Convergence: sliding window + plateau detection
-- Evaluation: adversarial (different model than agent)
+- ~700 lines, single file
+- Git-native keep/revert (commit on kept, checkout on reverted)
+- Cost in USD (self-reported by agent, not automatic token counting)
+- Hooks via pi's bash tool (beforeEach/afterEach)
+- Dashboard via pi's widget
+- Convergence: blocked audit (3 consecutive same-blocker turns)
+- Evaluation: completion audit in continuation template (adversarial-by-design)
+- Influenced by Codex CLI, Claude Code, Karpathy autoresearch

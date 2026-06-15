@@ -30,8 +30,15 @@ bun test
 
 ## Key Patterns
 
-- Script-as-plan: model writes goal, runtime executes loop
-- Adversarial evaluation: evaluator is different model than optimizer
+- Completion audit: built into continuation template (adversarial-by-design)
+- Blocked audit: 3 consecutive turns of same blocker before marking blocked
+- Agent-set goals: create_goal tool enables meta-prompting
 - Git-native: commit on keep, reset on revert
 - Iteration log: plain markdown, agent reads directly
 - Ideas backlog: plain markdown, prevents random walk
+
+## Influences
+
+- Codex CLI — completion audit, blocked audit, agent-set goals
+- Claude Code — external evaluator pattern
+- Karpathy autoresearch — git-native keep/revert, metric loop
