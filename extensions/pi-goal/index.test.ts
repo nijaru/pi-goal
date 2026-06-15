@@ -69,6 +69,28 @@ describe("pi-goal extension", () => {
     expect(result.details.goal.status).toBe("active");
   });
 
+  test("create_goal rejects empty objective", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const ctx = createMockCtx();
+    const result = await createGoal.execute("c1", { objective: "  ", budget: 5 }, undefined, undefined, ctx);
+    expect(result.content[0].text).toContain("Objective is required");
+  });
+
+  test("create_goal rejects non-positive budget", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const ctx = createMockCtx();
+    const result = await createGoal.execute("c1", { objective: "test", budget: 0 }, undefined, undefined, ctx);
+    expect(result.content[0].text).toContain("Budget must be positive");
+  });
+
   test("create_goal rejects if active goal exists", async () => {
     const mod = await import("./index.ts");
     const pi = createMockAPI();
