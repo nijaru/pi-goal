@@ -58,7 +58,7 @@ These are tools the agent calls while pursuing a goal:
 | `update_goal` | Mark complete or blocked |
 | `log_iteration` | Record attempt, git commit/revert |
 | `log_idea` | Log promising approach to ideas backlog |
-| `evaluate_goal` | Optional self-evaluation checkpoint |
+| `evaluate_goal` | Optional evaluation (self or adversarial) |
 
 The agent can create goals for itself or for subagents via `create_goal`, enabling meta-prompting.
 
@@ -96,6 +96,15 @@ create_goal({
 - **Budget cap:** There are no unbounded loops. When the budget is exhausted, the goal becomes `budget_limited`.
 - **Auto-continue limit:** The loop stops after 50 automatic continuations as a guardrail.
 - **Widget:** A status widget shows the current objective, status, iteration count, and cost.
+
+## Adversarial Evaluation
+
+The `evaluate_goal` tool supports two modes:
+
+- **Self mode** (default): The agent evaluates its own progress. Cheap and fast, but has self-preference bias. Works well for goals with concrete evidence (tests pass, build succeeds).
+- **Adversarial mode**: Sends the goal and recent evidence to the agent with a skeptical prompt. The agent must argue against completion, citing specific evidence for each requirement. Better for subjective goals or when extra confidence is needed.
+
+Use adversarial mode for goals like "refactor for clarity" or "improve code quality." For goals with objective metrics, hooks (`afterEach`) or self mode are sufficient.
 
 ## How It Works
 

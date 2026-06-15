@@ -257,9 +257,14 @@ const UpdateGoalParams = Type.Object({
 });
 
 const EvaluateGoalParams = Type.Object({
-  analysis: Type.String({ description: "Evidence-based analysis of whether the objective is met" }),
-  verdict: StringEnum(["achieved", "not_yet"] as const),
-  reasoning: Type.String({ description: "Detailed reasoning with evidence citations" }),
+  mode: Type.Optional(StringEnum(["self", "adversarial"] as const, {
+    description: "Evaluation mode. 'self' (default) uses the agent's own assessment. 'adversarial' sends a skeptical evaluation request.",
+  })),
+  analysis: Type.Optional(Type.String({ description: "Evidence-based analysis (required for self mode)" })),
+  verdict: Type.Optional(StringEnum(["achieved", "not_yet"] as const, {
+    description: "Verdict (required for self mode)",
+  })),
+  reasoning: Type.Optional(Type.String({ description: "Detailed reasoning with evidence citations (required for self mode)" })),
 });
 
 const LogIterationParams = Type.Object({
@@ -546,6 +551,7 @@ export default function piGoal(pi: ExtensionAPI) {
     promptGuidelines: [
       "Optional — the continuation prompt already includes a completion audit.",
       "Use for extra confidence when the stakes are high or the objective is ambiguous.",
+      "evaluate_goal with mode 'adversarial' sends a skeptical evaluation request. Use for subjective goals.",
     ],
     parameters: EvaluateGoalParams,
 
@@ -554,26 +560,73 @@ export default function piGoal(pi: ExtensionAPI) {
       if (check) return err(check);
       const g = rt.goal!;
 
-      if (params.verdict === "achieved") {
+      const mode = params.mode ?? "self";
+
+      if (mode === "self") {
+        if (!params.analysis || !params.verdict || !params.reasoning) {
+          return err("❌ Self mode requires analysis, verdict, and reasoning.");
+        }
+
+        if (params.verdict === "achieved") {
+          return ok([
+            `✅ Evaluation: achieved`,
+            `Analysis: ${params.analysis}`,
+            `Reasoning: ${params.reasoning}`,
+            "",
+            "Call update_goal with status 'complete' to finalize.",
+          ].join("\n"), { goal: g, verdict: "achieved" });
+        }
+
         return ok([
-          `✅ Evaluation: achieved`,
+          `⏳ Evaluation: not yet`,
           `Analysis: ${params.analysis}`,
           `Reasoning: ${params.reasoning}`,
           "",
-          "Call update_goal with status 'complete' to finalize.",
-        ].join("\n"), { goal: g, verdict: "achieved" });
+          "Continue working. The continuation prompt will guide the next iteration.",
+        ].join("\n"), { goal: g, verdict: "not_yet" });
       }
 
-      return ok([
-        `⏳ Evaluation: not yet`,
-        `Analysis: ${params.analysis}`,
-        `Reasoning: ${params.reasoning}`,
+      // Adversarial mode — send skeptical evaluation request
+      const recent = g.iterations.slice(-3);
+      const prompt = [
+        "You are performing an adversarial evaluation of a goal. Be skeptical. Your job is to find problems, not confirm success.",
         "",
-        "Continue working. The continuation prompt will guide the next iteration.",
-      ].join("\n"), { goal: g, verdict: "not_yet" });
+        `Goal: ${g.objective}`,
+        "",
+        "Recent iterations:",
+        ...recent.map(it => `- [${it.status}] ${it.hypothesis} → ${it.result}`),
+        "",
+        "Your task:",
+        "1. Derive concrete, verifiable requirements from the goal",
+        "2. For each requirement, check if the evidence proves it is met",
+        "3. Look for gaps, weak evidence, incomplete work, or overlooked requirements",
+        "4. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
+        "",
+        "Do not rely on intent, partial progress, or plausible assumptions. If any requirement is unproven, incomplete, or has weak evidence, the goal is not achieved.",
+        "",
+        "Respond with:",
+        "- verdict: 'achieved' or 'not_yet'",
+        "- analysis: what you found (be specific)",
+        "- reasoning: cite specific evidence for each requirement",
+      ].join("\n");
+
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+
+      return ok([
+        "⏳ Adversarial evaluation requested.",
+        "The agent will evaluate from a skeptical perspective in the next turn.",
+        "",
+        `Goal: ${g.objective}`,
+        `Budget: ${fmt$(g.costUsed)} / ${fmt$(g.budget)}`,
+      ].join("\n"), { goal: g, mode: "adversarial" });
     },
 
-    renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("evaluate_goal ")) + theme.fg(args.verdict === "achieved" ? "success" : "warning", args.verdict), 0, 0); },
+    renderCall(args, theme) {
+      const mode = args.mode ?? "self";
+      const verdict = args.verdict ?? "";
+      const verdictColor = verdict === "achieved" ? "success" : verdict === "not_yet" ? "warning" : "accent";
+      return new Text(theme.fg("toolTitle", theme.bold("evaluate_goal ")) + theme.fg(verdictColor, verdict || mode), 0, 0);
+    },
     renderResult(r, _, theme) { return new Text(r.content[0]?.type === "text" ? r.content[0].text : "", 0, 0); },
   });
 
