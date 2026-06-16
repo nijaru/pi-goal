@@ -52,6 +52,8 @@ interface Iteration {
   status: "kept" | "reverted";
   ts: string;
   commit?: string;
+  evidence?: string;
+  afterEach?: string;
 }
 
 interface GoalState {
@@ -163,11 +165,31 @@ const err = (text: string) => ok(text, {});
 
 // Journal
 function journalEntry(it: Iteration): string {
-  return `## Iteration ${it.n} — ${it.ts}\n- Hypothesis: ${it.hypothesis}\n- Result: ${it.result}\n- Cost: ${fmt$(it.cost)}\n- Status: ${it.status}${it.commit ? `\n- Commit: ${it.commit}` : ""}\n`;
+  let entry = `## Iteration ${it.n} — ${it.ts}\n- Hypothesis: ${it.hypothesis}\n- Result: ${it.result}\n- Cost: ${fmt$(it.cost)}\n- Status: ${it.status}`;
+  if (it.commit) entry += `\n- Commit: ${it.commit}`;
+  if (it.evidence) entry += `\n- Evidence:\n\`\`\`\n${it.evidence}\n\`\`\``;
+  if (it.afterEach) entry += `\n- afterEach:\n\`\`\`\n${it.afterEach}\n\`\`\``;
+  return entry + "\n";
 }
 
 function journalHeader(g: GoalState): string {
   return `# Iteration Log\n\nObjective: ${g.objective}\nBudget: ${fmt$(g.budget)}\nCreated: ${g.createdAt}\n\n`;
+}
+
+function detectStagnation(iterations: Iteration[]): string | null {
+  if (iterations.length < 3) return null;
+  const recent = iterations.slice(-3);
+
+  // All recent iterations have same status (all reverted or all kept with no progress)
+  const allReverted = recent.every(it => it.status === "reverted");
+  if (allReverted) return "Last 3 iterations were all reverted. Try a different approach — the current one isn't working.";
+
+  // Check for similar hypotheses (normalized Levenshtein-like: same first 50 chars)
+  const hypotheses = recent.map(it => it.hypothesis.toLowerCase().trim().slice(0, 50));
+  const allSimilar = hypotheses.every(h => h === hypotheses[0]);
+  if (allSimilar) return "Last 3 iterations have the same hypothesis. You may be repeating the same approach. Try log_idea to explore alternatives.";
+
+  return null;
 }
 
 // Continuation template — includes completion audit (adversarial-by-design)
@@ -195,13 +217,20 @@ Budget:
 - Remaining: ${fmt$(remaining)}
 - Iterations: ${g.iterations.length}
 
-${recent.length > 0 ? `Recent iterations:\n${recent.map(it => `- [${it.status}] ${it.hypothesis} → ${it.result}`).join("\n")}\n` : ""}Continuation behavior:
+${recent.length > 0 ? `Recent iterations:\n${recent.map(it => {
+  let line = `- [${it.status}] ${it.hypothesis} → ${it.result}`;
+  if (it.evidence) line += ` (evidence: ${it.evidence.slice(0, 100)}${it.evidence.length > 100 ? "..." : ""})`;
+  if (it.afterEach) line += ` (afterEach: ${it.afterEach.slice(0, 100)}${it.afterEach.length > 100 ? "..." : ""})`;
+  return line;
+}).join("\n")}\n` : ""}Continuation behavior:
 - This goal persists across turns. Ending this turn does not require shrinking the objective to what fits now.
 - Keep the full objective intact. If it cannot be finished now, make concrete progress toward the real requested end state, leave the goal active, and do not redefine success around a smaller or easier task.
 - Temporary rough edges are acceptable while the work is moving in the right direction. Completion still requires the requested end state to be true and verified.
 
 Work from evidence:
 Use the current worktree and external state as authoritative. Previous conversation context can help locate relevant work, but inspect the current state before relying on it. Improve, replace, or remove existing work as needed to satisfy the actual objective.
+
+When logging iterations, include evidence: actual command output, test results, file contents. Claims like "tests pass" without showing output are unverified — the evaluator will reject them.
 
 Fidelity:
 - Optimize each turn for movement toward the requested end state, not for the smallest stable-looking subset or easiest passing change.
@@ -273,6 +302,7 @@ const LogIterationParams = Type.Object({
   result: Type.String({ description: "What happened — evidence of progress or failure" }),
   cost: Type.Number({ description: "Cost in USD for this iteration" }),
   status: StringEnum(["kept", "reverted"] as const),
+  evidence: Type.Optional(Type.String({ description: "Command output or test results that prove the result. Include actual output, not claims." })),
 });
 
 const LogIdeaParams = Type.Object({
@@ -636,6 +666,13 @@ export default function piGoal(pi: ExtensionAPI) {
 
       // Adversarial mode — build prompt for fresh-context subagent evaluation
       const recent = g.iterations.slice(-5);
+      const iterationLines = recent.map(it => {
+        let line = `- [${it.status}] Iter ${it.n}: ${it.hypothesis} → ${it.result}`;
+        if (it.evidence) line += `\n  Evidence: ${it.evidence.slice(0, 200)}`;
+        if (it.afterEach) line += `\n  afterEach: ${it.afterEach.slice(0, 200)}`;
+        return line;
+      });
+
       const prompt = [
         "You are performing an adversarial evaluation of a goal. Be skeptical. Your job is to find problems, not confirm success.",
         "",
@@ -643,16 +680,18 @@ export default function piGoal(pi: ExtensionAPI) {
         `Budget used: ${fmt$(g.costUsed)} / ${fmt$(g.budget)}`,
         `Iterations: ${g.iterations.length}`,
         "",
-        "Recent iterations:",
-        ...recent.map(it => `- [${it.status}] Iter ${it.n}: ${it.hypothesis} → ${it.result}`),
+        "Recent iterations (with evidence):",
+        ...iterationLines,
         "",
         "Your task:",
         "1. Derive concrete, verifiable requirements from the goal",
         "2. For each requirement, check if the iteration evidence proves it is met",
-        "3. Look for gaps, weak evidence, incomplete work, or overlooked requirements",
-        "4. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
+        "3. Look for claims without evidence — 'tests pass' without showing test output is not proof",
+        "4. Look for gaps, weak evidence, incomplete work, or overlooked requirements",
+        "5. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
         "",
         "Do not rely on intent, partial progress, or plausible assumptions. If any requirement is unproven, incomplete, or has weak evidence, the goal is not achieved.",
+        "Unverified claims (no evidence, no command output) are not proof. Demand actual output.",
         "",
         "Respond with:",
         "- verdict: 'achieved' or 'not_yet'",
@@ -692,6 +731,7 @@ export default function piGoal(pi: ExtensionAPI) {
       "Call after each attempt to record what you tried.",
       "'kept' = git commit. 'reverted' = git reset.",
       "Always include cost estimate.",
+      "Include evidence (command output, test results) when available. Claims without evidence are weaker.",
     ],
     parameters: LogIterationParams,
 
@@ -730,6 +770,7 @@ export default function piGoal(pi: ExtensionAPI) {
         n: g.iterations.length + 1,
         hypothesis: params.hypothesis, result: params.result,
         cost: params.cost, status: params.status, ts: now(),
+        evidence: params.evidence,
       };
 
       g.iterations.push(it);
@@ -753,13 +794,22 @@ export default function piGoal(pi: ExtensionAPI) {
         it.commit = (sha.stdout || "").trim();
       }
 
-      // afterEach hook
+      // afterEach hook — capture output in iteration for evaluator visibility
       if (g.afterEach) {
         try {
           const r = await pi.exec("bash", ["-c", g.afterEach], { cwd: ctx.cwd, timeout: 30000 });
-          if (r.code !== 0) gitMsg += `\n⚠️ afterEach failed: ${(r.stdout + r.stderr).trim().slice(-300)}`;
-        } catch (e) { gitMsg += `\n⚠️ afterEach error: ${e instanceof Error ? e.message : String(e)}`; }
+          const afterEachOutput = (r.stdout + r.stderr).trim();
+          it.afterEach = afterEachOutput.slice(-500);
+          if (r.code !== 0) gitMsg += `\n⚠️ afterEach failed: ${afterEachOutput.slice(-300)}`;
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          it.afterEach = `error: ${errMsg}`;
+          gitMsg += `\n⚠️ afterEach error: ${errMsg}`;
+        }
       }
+
+      // Stagnation detection — warn if agent is repeating itself
+      const stagnation = detectStagnation(g.iterations);
 
       // Journal
       try { fs.appendFileSync(goalPaths(ctx.cwd, g.id).journal, journalEntry(it)); } catch {}
@@ -767,13 +817,15 @@ export default function piGoal(pi: ExtensionAPI) {
       save(ctx.cwd);
       updateWidget(ctx);
 
-      return ok([
+      const parts = [
         `${params.status === "kept" ? "✓" : "↩"} Iteration ${it.n}: ${params.status}`,
         `Hypothesis: ${params.hypothesis}`,
-        `Result: ${params.result}`,
+        `Result: ${it.result}`,
         `Cost: ${fmt$(params.cost)} (total: ${fmt$(g.costUsed)} / ${fmt$(g.budget)})`,
         gitMsg,
-      ].join("\n"), { iteration: it, goal: g });
+      ];
+      if (stagnation) parts.push(`\n⚠️ ${stagnation}`);
+      return ok(parts.join("\n"), { iteration: it, goal: g });
     },
 
     renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("log_iteration ")) + theme.fg(args.status === "kept" ? "success" : "warning", args.status) + theme.fg("dim", ` ${args.hypothesis.slice(0, 50)}`), 0, 0); },
@@ -867,7 +919,13 @@ export default function piGoal(pi: ExtensionAPI) {
       `Status: ${g.status} | Budget: ${fmt$(g.costUsed)} / ${fmt$(g.budget)} | Iterations: ${g.iterations.length}`,
       g.blockedCount > 0 ? `Blocked: ${g.blockedCount}/${BLOCKED_THRESHOLD}` : "",
       "",
-      ...recent.flatMap(it => [`### Iter ${it.n} — ${it.status}`, `- ${it.hypothesis} → ${it.result}`, `- Cost: ${fmt$(it.cost)}`, ""]),
+      ...recent.flatMap(it => {
+        const lines = [`### Iter ${it.n} — ${it.status}`, `- ${it.hypothesis} → ${it.result}`, `- Cost: ${fmt$(it.cost)}`];
+        if (it.evidence) lines.push(`- Evidence: ${it.evidence.slice(0, 150)}`);
+        if (it.afterEach) lines.push(`- afterEach: ${it.afterEach.slice(0, 150)}`);
+        lines.push("");
+        return lines;
+      }),
       g.iterations.length > 5 ? `... and ${g.iterations.length - 5} earlier` : "",
       (() => { const ideas = readIdeas(cwd, g.id); return ideas ? `\n## Ideas\n${ideas}` : ""; })(),
     ].filter(Boolean).join("\n");

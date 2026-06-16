@@ -163,10 +163,24 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 
 ## Influences
 
-- **Codex CLI** — completion audit, blocked audit, agent-set goals
-- **Claude Code** — external evaluator pattern
-- **Karpathy autoresearch** — git-native keep/revert, metric loop
-- **SELFGOAL** — hierarchical goal decomposition (future)
+### Loop Patterns
+
+- **Ralph Loop** (Geoffrey Huntley, 2025) — `while :; do cat PROMPT.md | claude; done`. Fresh context each iteration, task completion via completion promise or test results. Ralph proved the simplest viable loop. Pi-goal inherits the "loop until done" skeleton but adds persistent state (Ralph discards context each iteration).
+
+- **Autoresearch** (Karpathy, 2025) — Single mutable file, metric-driven, git-native keep/revert, never stops. Pi-goal inherits git-native checkpointing and the keep/revert pattern, but adds explicit stopping criteria.
+
+- **Ralph Loop Optimizer** (haoran-ni) — Bridges Ralph and autoresearch: domain-agnostic optimization with Ralph-style orchestration + autoresearch-style evaluation logging. Closest prior art to pi-goal's design.
+
+### Goal Implementations
+
+- **Codex CLI /goal** — Server-side SQLite persistence, model self-decides completion. Pi-goal uses file-based persistence (same idea, local-first). Codex has no hard cost budget; pi-goal does.
+
+- **Claude Code /goal** — Separate evaluator model (Haiku) with fresh context window. Confirmed the "never self-evaluate" pattern. Pi-goal uses the same fresh-context principle with subagent.
+
+### Evaluation Research
+
+- **Agent-as-a-Judge** (ICML 2025) — Agentic evaluation with intermediate feedback outperforms single LLM calls. Validates pi-goal's adversarial evaluation approach.
+- **SELFGOAL** — Hierarchical goal decomposition (future consideration).
 
 ## File Structure
 
@@ -183,6 +197,8 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 - Git-native keep/revert (commit on kept, checkout on reverted)
 - Cost in USD (self-reported by agent, not automatic token counting)
 - Evaluator: adversarial mode uses fresh context (subagent preferred, fresh turn fallback) to avoid self-evaluation bias
+- Evidence: iterations should include command output/test results; claims without evidence are weaker
+- Stagnation: warns when last 3 iterations have same hypothesis or all reverted
 - Hooks via pi's bash tool (beforeEach/afterEach)
 - Dashboard via pi's widget
 - Convergence: blocked audit (3 consecutive same-blocker turns)

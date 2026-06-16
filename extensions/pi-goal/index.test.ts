@@ -430,6 +430,64 @@ describe("pi-goal extension", () => {
     expect(result.content[0].text).toContain("No active goal");
   });
 
+  test("log_iteration stores evidence in journal", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    pi.exec.mockImplementation(async () => ({ code: 0, stdout: "", stderr: "" }));
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const logIteration = pi.getTool("log_iteration");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+
+    const result = await logIteration.execute("c2", {
+      hypothesis: "fix tests", result: "all pass", cost: 0.1, status: "kept",
+      evidence: "bun test: 29 pass, 0 fail",
+    }, undefined, undefined, ctx);
+
+    expect(result.details.iteration.evidence).toBe("bun test: 29 pass, 0 fail");
+  });
+
+  test("log_iteration warns on stagnation (3 similar hypotheses)", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    pi.exec.mockImplementation(async () => ({ code: 0, stdout: "", stderr: "" }));
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const logIteration = pi.getTool("log_iteration");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+
+    await logIteration.execute("c2", { hypothesis: "try X", result: "failed", cost: 0.1, status: "reverted" }, undefined, undefined, ctx);
+    await logIteration.execute("c3", { hypothesis: "try X", result: "failed again", cost: 0.1, status: "reverted" }, undefined, undefined, ctx);
+    const r = await logIteration.execute("c4", { hypothesis: "try X", result: "still failing", cost: 0.1, status: "reverted" }, undefined, undefined, ctx);
+
+    expect(r.content[0].text).toContain("Last 3 iterations");
+    expect(r.content[0].text).toContain("reverted");
+  });
+
+  test("log_iteration stores afterEach output when hook configured", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    pi.exec.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === "git") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "bash" && args[1] === "echo ok") return { code: 0, stdout: "ok\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const logIteration = pi.getTool("log_iteration");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5, afterEach: "echo ok" }, undefined, undefined, ctx);
+
+    const r = await logIteration.execute("c2", { hypothesis: "fix", result: "done", cost: 0.1, status: "kept" }, undefined, undefined, ctx);
+
+    expect(r.details.iteration.afterEach).toContain("ok");
+  });
+
   // --- /goal command ---
 
   test("/goal pause and resume", async () => {
