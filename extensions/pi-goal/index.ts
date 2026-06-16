@@ -733,7 +733,7 @@ export default function piGoal(pi: ExtensionAPI) {
     promptSnippet: "Record iteration",
     promptGuidelines: [
       "Call after each attempt to record what you tried.",
-      "In a git repo: 'kept' commits, 'reverted' resets. Outside a git repo: iteration is logged to journal only.",
+      "In a git repo: 'kept' commits, 'reverted' resets. No git repo: logged to journal only.",
       "Always include cost estimate.",
       "Include evidence (command output, test results) when available. Claims without evidence are weaker.",
     ],
@@ -829,7 +829,7 @@ export default function piGoal(pi: ExtensionAPI) {
         `Hypothesis: ${params.hypothesis}`,
         `Result: ${it.result}`,
         `Cost: ${fmt$(params.cost)} (total: ${fmt$(g.costUsed)} / ${fmt$(g.budget)})`,
-        gitMsg,
+        ...(gitMsg ? [gitMsg] : []),
       ];
       if (stagnation) parts.push(`\n⚠️ ${stagnation}`);
       return ok(parts.join("\n"), { iteration: it, goal: g });
