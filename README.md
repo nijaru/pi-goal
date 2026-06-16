@@ -10,17 +10,7 @@ Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal fo
 pi install git:github.com/nijaru/pi-goal
 ```
 
-Or copy manually:
-
-```bash
-# Global
-cp -r . ~/.pi/agent/extensions/pi-goal
-
-# Project-local
-cp -r . .pi/extensions/pi-goal
-```
-
-**Requires:** pi with extension support, a git repository.
+Must be run inside a git repository (pi-goal commits on keep and reverts on revert).
 
 ## Quick Start
 
