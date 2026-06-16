@@ -2,15 +2,15 @@
 
 Persistent autonomous goals for pi. Define what "done" means, and the agent works until it's done — across turns, with a completion audit and a budget cap.
 
-## Installation
+Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal formalizes it with persistent state, git-native checkpoints, and a separate evaluator so the agent can't grade its own homework.
 
-Install from git:
+## Installation
 
 ```bash
 pi install git:github.com/nijaru/pi-goal
 ```
 
-Or copy manually to your extensions directory:
+Or copy manually:
 
 ```bash
 # Global
@@ -20,24 +20,29 @@ cp -r . ~/.pi/agent/extensions/pi-goal
 cp -r . .pi/extensions/pi-goal
 ```
 
-## Requirements
+**Requires:** pi with extension support, a git repository (pi-goal commits on keep and reverts on revert).
 
-- pi with extension support
-- A git repository (pi-goal commits on keep and reverts on revert)
-
-## Usage
-
-Use `/goal` in pi's interactive editor:
+## Quick Start
 
 ```
-/goal all tests pass and lint is clean
+> /goal all tests pass and lint is clean
+
+✅ Goal created
+Objective: all tests pass
+Budget: $5.00
 ```
 
-The agent creates a goal, then works autonomously until the goal is complete, blocked, or budget-limited. The loop continues across turns without manual prompting.
+The agent works autonomously. A status widget shows progress:
 
-### Commands
+```
+─── Goal ───────────────────────────────
+  ◉ active  iter: 3  cost: $0.12 / $5.00
+  all tests pass and lint is clean
+```
 
-These are slash commands for you:
+Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits (`kept`). If not, it reverts (`reverted`). The loop continues until the goal is met, blocked, or the budget runs out.
+
+## User Commands
 
 | Command | Description |
 |---------|-------------|
@@ -47,38 +52,22 @@ These are slash commands for you:
 | `/goal resume` | Resume a paused goal |
 | `/goal clear` | Clear the current goal |
 
-## Tools
+## Agent Tools
 
-These are tools the agent calls while pursuing a goal:
+The agent calls these automatically while pursuing a goal:
 
 | Tool | Description |
 |------|-------------|
-| `create_goal` | Set objective + budget (agent or user) |
+| `create_goal` | Set objective + budget |
 | `get_goal` | Read current goal state |
 | `update_goal` | Mark complete or blocked |
 | `log_iteration` | Record attempt, git commit/revert |
-| `log_idea` | Log promising approach to ideas backlog |
-| `evaluate_goal` | Optional evaluation (self or adversarial) |
+| `log_idea` | Log approach to ideas backlog |
+| `evaluate_goal` | Self or adversarial evaluation |
 
 The agent can create goals for itself or for subagents via `create_goal`, enabling meta-prompting.
 
 ## Configuration
-
-Set when creating a goal:
-
-```js
-create_goal({
-  objective: "all tests pass",
-  budget: 5,
-});
-```
-
-- `budget` — required, in USD. The loop stops when cost exceeds the budget.
-- `objective` — required, should be concrete and verifiable.
-- `beforeEach` — optional shell command run before each iteration.
-- `afterEach` — optional shell command run after each iteration.
-
-Example with hooks:
 
 ```js
 create_goal({
@@ -89,36 +78,36 @@ create_goal({
 });
 ```
 
-## Safety / Behavior
+- `budget` — required, in USD. The loop stops when cost exceeds this.
+- `objective` — required, should be concrete and verifiable.
+- `beforeEach` / `afterEach` — optional shell commands run before/after each iteration.
 
-- **Autonomous loop:** Once active, the agent continues working across turns without further prompts.
-- **Git side effects:** `log_iteration` with `status: "kept"` commits the working tree; `status: "reverted"` resets it.
-- **Budget cap:** There are no unbounded loops. When the budget is exhausted, the goal becomes `budget_limited`.
-- **Auto-continue limit:** The loop stops after 50 automatic continuations as a guardrail.
-- **Widget:** A status widget shows the current objective, status, iteration count, and cost.
+## Safety
+
+- **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
+- **Auto-continue limit.** 50 automatic continuations maximum as a guardrail.
+- **Git side effects.** `kept` commits the working tree; `reverted` resets it. Each iteration is a checkpoint you can inspect.
+- **Completion audit.** A separate evaluator (subagent with fresh context) must confirm the goal is met before the agent can mark it complete. The agent can't grade its own homework.
+- **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked. Resuming starts a fresh audit.
 
 ## Adversarial Evaluation
 
-The `evaluate_goal` tool supports two modes:
+`evaluate_goal` supports two modes:
 
-- **Self mode** (default): The agent evaluates its own progress. Cheap and fast, but has self-preference bias. Works well for goals with concrete evidence (tests pass, build succeeds).
-- **Adversarial mode**: Returns a prompt for a subagent with a fresh context window. The subagent evaluates from a skeptical perspective, arguing against completion and citing specific evidence. Fresh context avoids self-evaluation bias — agents judge their own work more favorably.
-
-Use adversarial mode for goals like "refactor for clarity" or "improve code quality." For goals with objective metrics, hooks (`afterEach`) or self mode are sufficient.
+- **Self** (default): Agent evaluates its own progress. Cheap, fast. Works for goals with objective evidence (tests pass, build succeeds).
+- **Adversarial**: Spawns a subagent with a fresh context window that argues against completion. Use for subjective goals like "refactor for clarity."
 
 ## How It Works
 
-**Completion audit** — The continuation prompt requires the agent to spawn a subagent with a fresh context window for objective evaluation. Self-evaluation is biased (Anthropic confirmed: agents judge their own work more favorably), so the evaluator must be a separate context. The agent can only mark complete after the evaluator confirms 'achieved'.
+**Git-native.** Each iteration commits on `kept` or reverts on `reverted`. The worktree is the source of truth.
 
-**Blocked audit** — After 3 consecutive turns of the same blocker, the goal is marked blocked. Different blockers reset the counter. Resuming a blocked goal starts a fresh audit.
+**Ideas backlog.** Promising-but-untried approaches are logged and surfaced in continuation prompts to prevent random walk.
 
-**Git-native** — Each iteration commits on `kept` or reverts on `reverted`. The worktree is the source of truth.
+**Iteration journal.** Every attempt is recorded in `.pi/goal/<id>/journal.md` with hypothesis, result, cost, and commit hash.
 
-**Ideas backlog** — Promising-but-untried approaches are logged and surfaced in continuation prompts to prevent random walk.
+**Compaction-aware.** Goal state survives context compaction.
 
-**Iteration journal** — Every logged attempt is recorded in `.pi/goal/<id>/journal.md` with hypothesis, result, cost, and commit hash.
-
-**Compaction-aware** — Goal state is included in compaction summaries so the loop survives context compaction.
+See [DESIGN.md](DESIGN.md) for the full API design, convergence criteria, and prior art.
 
 ## Goal Lifecycle
 
