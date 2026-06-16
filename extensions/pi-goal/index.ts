@@ -146,6 +146,10 @@ async function gitRevert(pi: ExtensionAPI, cwd: string): Promise<string> {
   }
 }
 
+function isGitRepo(cwd: string): boolean {
+  return fs.existsSync(path.join(cwd, ".git"));
+}
+
 // Validation helpers
 function requireGoal(g: GoalState | null): string | null {
   return g ? null : "❌ No active goal. Call create_goal first.";
@@ -725,11 +729,11 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "log_iteration",
     label: "Log Iteration",
-    description: "Record iteration result. Commits on 'kept', reverts on 'reverted'. Updates journal. Runs hooks if configured.",
-    promptSnippet: "Record iteration (git commit/revert)",
+    description: "Record iteration result. Updates journal. In git repos, commits on 'kept' and reverts on 'reverted'. Runs hooks if configured.",
+    promptSnippet: "Record iteration",
     promptGuidelines: [
       "Call after each attempt to record what you tried.",
-      "'kept' = git commit. 'reverted' = git reset.",
+      "In a git repo: 'kept' commits, 'reverted' resets. Outside a git repo: iteration is logged to journal only.",
       "Always include cost estimate.",
       "Include evidence (command output, test results) when available. Claims without evidence are weaker.",
     ],
@@ -783,15 +787,18 @@ export default function piGoal(pi: ExtensionAPI) {
         g.lastBlocker = null;
       }
 
-      // Git
-      const commitMsg = `goal: ${params.hypothesis}\n\nObjective: ${g.objective}\nIteration: ${it.n}`;
-      let gitMsg = params.status === "kept"
-        ? await gitCommit(pi, ctx.cwd, commitMsg)
-        : await gitRevert(pi, ctx.cwd);
+      // Git (optional — skip if not in a git repo)
+      let gitMsg = "";
+      if (isGitRepo(ctx.cwd)) {
+        const commitMsg = `goal: ${params.hypothesis}\n\nObjective: ${g.objective}\nIteration: ${it.n}`;
+        gitMsg = params.status === "kept"
+          ? await gitCommit(pi, ctx.cwd, commitMsg)
+          : await gitRevert(pi, ctx.cwd);
 
-      if (params.status === "kept" && gitMsg.includes("committed")) {
-        const sha = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: ctx.cwd, timeout: 5000 }).catch(() => ({ stdout: "" }));
-        it.commit = (sha.stdout || "").trim();
+        if (params.status === "kept" && gitMsg.includes("committed")) {
+          const sha = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: ctx.cwd, timeout: 5000 }).catch(() => ({ stdout: "" }));
+          it.commit = (sha.stdout || "").trim();
+        }
       }
 
       // afterEach hook — capture output in iteration for evaluator visibility

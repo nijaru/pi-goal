@@ -11,7 +11,7 @@ See DESIGN.md for the full API design and implementation notes.
 - Single extension, ~300-400 lines
 - Entry: `extensions/pi-goal/index.ts`
 - Files stored in `.pi/goal/<goal-id>/`
-- Git-native keep/revert
+- Git-native keep/revert (when in a git repo)
 - Adversarial evaluation (different model than agent)
 - Ideas backlog to prevent random walk
 
@@ -33,7 +33,7 @@ bun test
 - Completion audit: subagent with fresh context window (avoids self-evaluation bias)
 - Blocked audit: 3 consecutive turns of same blocker before marking blocked
 - Agent-set goals: create_goal tool enables meta-prompting
-- Git-native: commit on keep, reset on revert
+- Git-native: commit on keep, reset on revert (optional, when in a git repo)
 - Iteration log: plain markdown, agent reads directly
 - Ideas backlog: plain markdown, prevents random walk
 

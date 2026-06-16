@@ -2,6 +2,7 @@
  * pi-goal extension tests
  */
 import { describe, test, expect, mock } from "bun:test";
+import * as fs from "node:fs";
 
 const createMockAPI = () => {
   const tools = new Map<string, any>();
@@ -348,6 +349,7 @@ describe("pi-goal extension", () => {
     const logIteration = pi.getTool("log_iteration");
     const getGoal = pi.getTool("get_goal");
     const ctx = createMockCtx();
+    fs.mkdirSync(ctx.cwd + "/.git", { recursive: true });
     await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
 
     const result = await logIteration.execute("c2", {
@@ -363,6 +365,29 @@ describe("pi-goal extension", () => {
     const state = await getGoal.execute("c3", {}, undefined, undefined, ctx);
     expect(state.content[0].text).toContain("Iterations: 1");
     expect(state.content[0].text).toContain("$0.50");
+    fs.rmSync(ctx.cwd + "/.git", { recursive: true, force: true });
+  });
+
+  test("log_iteration skips git when not in a git repo", async () => {
+    const mod = await import("./index.ts");
+    const pi = createMockAPI();
+    mod.default(pi as any);
+
+    const createGoal = pi.getTool("create_goal");
+    const logIteration = pi.getTool("log_iteration");
+    const ctx = createMockCtx();
+    await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
+
+    const result = await logIteration.execute("c2", {
+      hypothesis: "add caching", result: "improved", cost: 0.5, status: "kept",
+    }, undefined, undefined, ctx);
+
+    expect(result.content[0].text).toContain("Iteration 1");
+    expect(result.content[0].text).toContain("kept");
+    expect(result.details.iteration.n).toBe(1);
+    expect(result.details.iteration.commit).toBeUndefined();
+    // git exec should not have been called
+    expect(pi.exec).not.toHaveBeenCalled();
   });
 
   test("log_iteration marks budget_limited and still records iteration", async () => {

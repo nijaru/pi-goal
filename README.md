@@ -10,8 +10,6 @@ Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal fo
 pi install git:github.com/nijaru/pi-goal
 ```
 
-Must be run inside a git repository (pi-goal commits on keep and reverts on revert).
-
 ## Quick Start
 
 ```
@@ -30,7 +28,7 @@ A status widget shows progress:
   all tests pass and lint is clean
 ```
 
-Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits. If not, it reverts.
+Each iteration, the agent makes a change, runs your hooks, and logs the result. In a git repo, changes are committed on success and reverted on failure.
 
 ## User Commands
 
@@ -46,14 +44,14 @@ Type these in the pi TUI:
 
 ## Agent Tools
 
-The agent calls these automatically — you don't need to use them directly:
+The agent calls these automatically. You don't need to use them directly:
 
 | Tool | Description |
 |------|-------------|
 | `create_goal` | Set objective + budget |
 | `get_goal` | Read current goal state |
 | `update_goal` | Mark complete or blocked |
-| `log_iteration` | Record attempt, git commit/revert |
+| `log_iteration` | Record attempt, checkpoint if in git repo |
 | `log_idea` | Log approach to ideas backlog |
 | `evaluate_goal` | Self or adversarial evaluation |
 
@@ -61,12 +59,12 @@ The agent calls these automatically — you don't need to use them directly:
 
 - **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
 - **Auto-continue limit.** 50 automatic continuations maximum.
-- **Completion audit.** A separate evaluator confirms the goal is met — the agent can't grade its own homework. Use `adversarial` mode for subjective goals, `self` for objective evidence.
+- **Completion audit.** A separate evaluator confirms the goal is met. The agent can't grade its own homework. Use `adversarial` mode for subjective goals, `self` for objective evidence.
 - **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked.
 
 ## How It Works
 
-The agent keeps working until the goal is met or the budget runs out. Each attempt is checkpointed with git — you can inspect or roll back any iteration. A separate evaluator checks the result before allowing completion.
+The agent keeps working until the goal is met or the budget runs out. Each attempt is checkpointed with git. You can inspect or roll back any iteration. A separate evaluator checks the result before allowing completion.
 
 See [DESIGN.md](DESIGN.md) for the full API design, convergence criteria, and prior art.
 
@@ -93,7 +91,7 @@ paused → active         (/goal resume)
 
 - **Codex CLI** inspired the completion audit, blocked audit, and agent-set goals
 - **Claude Code** demonstrated the external evaluator pattern
-- **Karpathy autoresearch** established git-native keep/revert and the metric loop
+- **Karpathy autoresearch** established the git-native keep/revert pattern and the metric loop
 
 ## License
 

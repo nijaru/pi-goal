@@ -66,7 +66,7 @@ const result = await evaluate_goal({ mode: "adversarial" });
 
 ### Keep/revert
 
-Git-native. Commit on keep, `git reset` on revert. Each iteration is a checkpoint.
+Git-native (when in a git repo). Commit on keep, `git reset` on revert. Each iteration is a checkpoint. Outside a git repo, iterations are logged to journal only.
 
 ### Ideas backlog
 
@@ -151,7 +151,7 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 | get_goal | Read-only | Check state |
 | update_goal | Agent | After completion audit |
 | evaluate_goal | Optional | Self or adversarial evaluation |
-| log_iteration | Agent | Git commit/revert |
+| log_iteration | Agent | Record iteration, checkpoint if in git repo |
 | log_idea | Agent | Anti-random-walk |
 
 ## What This Doesn't Do
@@ -194,7 +194,7 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 ## Implementation Notes
 
 - ~700 lines, single file
-- Git-native keep/revert (commit on kept, checkout on reverted)
+- Git-native keep/revert (commit on kept, checkout on reverted) — when in a git repo
 - Cost in USD (self-reported by agent, not automatic token counting)
 - Evaluator: adversarial mode uses fresh context (subagent preferred, fresh turn fallback) to avoid self-evaluation bias
 - Evidence: iterations should include command output/test results; claims without evidence are weaker
