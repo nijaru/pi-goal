@@ -1,8 +1,8 @@
 # pi-goal
 
-Persistent autonomous goals for pi. Define what "done" means, and the agent works until it's done — across turns, with a completion audit and a budget cap.
+Persistent autonomous goals for pi. Define what "done" means, and the agent works until it's done.
 
-Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal formalizes it with persistent state, git-native checkpoints, and a separate evaluator so the agent can't grade its own homework.
+Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal formalizes it with persistent state, git-native checkpoints, and a separate evaluator.
 
 ## Installation
 
@@ -20,7 +20,7 @@ cp -r . ~/.pi/agent/extensions/pi-goal
 cp -r . .pi/extensions/pi-goal
 ```
 
-**Requires:** pi with extension support, a git repository (pi-goal commits on keep and reverts on revert).
+**Requires:** pi with extension support, a git repository.
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ Objective: all tests pass
 Budget: $5.00
 ```
 
-The agent works autonomously. A status widget shows progress:
+A status widget shows progress:
 
 ```
 ─── Goal ───────────────────────────────
@@ -40,7 +40,7 @@ The agent works autonomously. A status widget shows progress:
   all tests pass and lint is clean
 ```
 
-Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits (`kept`). If not, it reverts (`reverted`). The loop continues until the goal is met, blocked, or the budget runs out.
+Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits. If not, it reverts. The loop continues until the goal is met, blocked, or the budget runs out.
 
 ## User Commands
 
@@ -65,7 +65,7 @@ The agent calls these automatically while pursuing a goal:
 | `log_idea` | Log approach to ideas backlog |
 | `evaluate_goal` | Self or adversarial evaluation |
 
-The agent can create goals for itself or for subagents via `create_goal`, enabling meta-prompting.
+The agent can create goals for itself or for subagents via `create_goal`.
 
 ## Configuration
 
@@ -78,28 +78,19 @@ create_goal({
 });
 ```
 
-- `budget` — required, in USD. The loop stops when cost exceeds this.
-- `objective` — required, should be concrete and verifiable.
-- `beforeEach` / `afterEach` — optional shell commands run before/after each iteration.
+- `budget` required, in USD. The loop stops when cost exceeds this.
+- `objective` required, should be concrete and verifiable.
+- `beforeEach` / `afterEach` optional shell commands run before/after each iteration.
 
 ## Safety
 
 - **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
 - **Auto-continue limit.** 50 automatic continuations maximum as a guardrail.
-- **Git side effects.** `kept` commits the working tree; `reverted` resets it. Each iteration is a checkpoint you can inspect.
 - **Completion audit.** A separate evaluator (subagent with fresh context) must confirm the goal is met before the agent can mark it complete. The agent can't grade its own homework.
-- **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked. Resuming starts a fresh audit.
-
-## Adversarial Evaluation
-
-`evaluate_goal` supports two modes:
-
-- **Self** (default): Agent evaluates its own progress. Cheap, fast. Works for goals with objective evidence (tests pass, build succeeds).
-- **Adversarial**: Spawns a subagent with a fresh context window that argues against completion. Use for subjective goals like "refactor for clarity."
+- **Evaluation modes.** Adversarial for subjective goals like "refactor for clarity." Self mode for objective evidence (tests pass, build succeeds).
+- **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked.
 
 ## How It Works
-
-**Git-native.** Each iteration commits on `kept` or reverts on `reverted`. The worktree is the source of truth.
 
 **Ideas backlog.** Promising-but-untried approaches are logged and surfaced in continuation prompts to prevent random walk.
 
@@ -130,9 +121,9 @@ paused → active         (/goal resume)
 
 ## Influences
 
-- **Codex CLI** — completion audit, blocked audit, agent-set goals
-- **Claude Code** — external evaluator pattern
-- **Karpathy autoresearch** — git-native keep/revert, metric loop
+- **Codex CLI** inspired the completion audit, blocked audit, and agent-set goals
+- **Claude Code** proved the external evaluator pattern
+- **Karpathy autoresearch** established git-native keep/revert and the metric loop
 
 ## License
 
