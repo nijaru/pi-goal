@@ -67,31 +67,6 @@ The agent calls these automatically — you don't need to use them directly:
 | `log_idea` | Log approach to ideas backlog |
 | `evaluate_goal` | Self or adversarial evaluation |
 
-## Configuration
-
-```js
-create_goal({
-  objective: "all tests pass",
-  budget: 5,
-});
-```
-
-- `objective` required, concrete and verifiable.
-- `budget` required, in USD.
-
-### Hooks
-
-Optional shell commands that run before/after each iteration:
-
-```js
-create_goal({
-  objective: "all tests pass",
-  budget: 5,
-  beforeEach: "git stash && git checkout baseline",
-  afterEach: "npm test",
-});
-```
-
 ## Safety
 
 - **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
