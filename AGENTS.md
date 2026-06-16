@@ -28,6 +28,19 @@ Persistent loop for pi. Define what "done" means, agent works until it's done.
 bun test
 ```
 
+## Tools
+
+| Tool | Key params | Notes |
+|------|-----------|-------|
+| `create_goal` | `objective`, `budget` | Fails if active goal exists |
+| `get_goal` | (none) | Read-only state check |
+| `update_goal` | `status`, `blocker?` | `complete`/`blocked`/`paused`/`cleared` |
+| `log_iteration` | `hypothesis`, `result`, `cost`, `status` | `kept` commits, `reverted` resets (git repos) |
+| `log_idea` | `idea` | Prevents random walk |
+| `evaluate_goal` | `mode`, `analysis?`, `verdict?` | `self` or `adversarial` |
+
+Goal statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused`; `paused` → `active`.
+
 ## Key Patterns
 
 - Completion audit: subagent with fresh context window (avoids self-evaluation bias)
