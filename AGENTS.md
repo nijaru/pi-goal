@@ -7,9 +7,6 @@ Persistent loop for pi. Define what "done" means, agent works until it's done.
 - Single extension, ~900 lines
 - Entry: `extensions/pi-goal/index.ts`
 - Files stored in `.pi/goal/<goal-id>/`
-- Git-native keep/revert (when in a git repo)
-- Adversarial evaluation (different model than agent)
-- Ideas backlog to prevent random walk
 
 ## Scope
 
