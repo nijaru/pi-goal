@@ -252,7 +252,12 @@ The audit process:
 6. Only after the evaluator confirms 'achieved' may you call update_goal with status 'complete'.
 
 Do not self-assess completion inline. Fresh context (subagent or fresh turn) corrects for self-preferential bias. If the evaluator returns 'not_yet', continue working.
+
+Decomposition signal:
 - If the cumulative diff exceeds ~1500 lines or touches >5 files, do not mark complete. Instead, decompose the remaining work into atomic tasks and log them.
+
+Anti-overfitting:
+- The completion audit must verify the solution works for the general case, not just the specific scenario that prompted it. Check edge cases, different input shapes, and fragile assumptions before marking complete.
 
 Blocked audit:
 - Do not call update_goal with status "blocked" the first time a blocker appears.
@@ -693,8 +698,10 @@ export default function piGoal(pi: ExtensionAPI) {
         "2. For each requirement, check if the iteration evidence proves it is met",
         "3. Look for claims without evidence — 'tests pass' without showing test output is not proof",
         "4. Look for gaps, weak evidence, incomplete work, or overlooked requirements",
-        "5. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
+        "5. Check that the solution generalizes beyond the specific scenario — edge cases, different inputs, fragile assumptions",
+        "6. Only mark 'achieved' if you are certain every requirement is proven by direct evidence",
         "",
+        "Calibration: your job is to find failures, not confirm completeness. Report what's missing, not just what's present. An unnecessary finding is cheaper than a missed failure.",
         "Do not rely on intent, partial progress, or plausible assumptions. If any requirement is unproven, incomplete, or has weak evidence, the goal is not achieved.",
         "Unverified claims (no evidence, no command output) are not proof. Demand actual output.",
         "",
