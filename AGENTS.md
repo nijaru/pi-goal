@@ -2,10 +2,6 @@
 
 Persistent loop for pi. Define what "done" means, agent works until it's done.
 
-## Design
-
-API examples, lifecycle, convergence, and file formats are documented in the code and README.
-
 ## Architecture
 
 - Single extension, ~900 lines
@@ -44,8 +40,4 @@ bun test
 - Iteration log: plain markdown, agent reads directly
 - Ideas backlog: plain markdown, prevents random walk
 
-## Influences
 
-- Codex CLI — completion audit, blocked audit, agent-set goals
-- Claude Code — external evaluator pattern
-- Karpathy autoresearch — git-native keep/revert, metric loop
