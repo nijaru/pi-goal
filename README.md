@@ -40,7 +40,7 @@ A status widget shows progress:
   all tests pass and lint is clean
 ```
 
-Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits. If not, it reverts. The loop continues until the goal is met, blocked, or the budget runs out.
+Each iteration, the agent makes a change, runs your hooks, and logs the result. If the change helps, it commits. If not, it reverts.
 
 ## User Commands
 
@@ -78,7 +78,7 @@ create_goal({
 });
 ```
 
-- `budget` required, in USD. The loop stops when cost exceeds this.
+- `budget` required, in USD.
 - `objective` required, should be concrete and verifiable.
 - `beforeEach` / `afterEach` optional shell commands run before/after each iteration.
 
@@ -122,7 +122,7 @@ paused → active         (/goal resume)
 ## Influences
 
 - **Codex CLI** inspired the completion audit, blocked audit, and agent-set goals
-- **Claude Code** proved the external evaluator pattern
+- **Claude Code** demonstrated the external evaluator pattern
 - **Karpathy autoresearch** established git-native keep/revert and the metric loop
 
 ## License
