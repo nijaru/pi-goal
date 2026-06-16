@@ -44,6 +44,8 @@ Each iteration, the agent makes a change, runs your hooks, and logs the result. 
 
 ## User Commands
 
+Type these in the pi TUI:
+
 | Command | Description |
 |---------|-------------|
 | `/goal <objective>` | Create a new goal |
@@ -54,7 +56,7 @@ Each iteration, the agent makes a change, runs your hooks, and logs the result. 
 
 ## Agent Tools
 
-The agent calls these automatically while pursuing a goal:
+The agent calls these automatically — you don't need to use them directly:
 
 | Tool | Description |
 |------|-------------|
@@ -65,9 +67,21 @@ The agent calls these automatically while pursuing a goal:
 | `log_idea` | Log approach to ideas backlog |
 | `evaluate_goal` | Self or adversarial evaluation |
 
-The agent can create goals for itself or for subagents via `create_goal`.
-
 ## Configuration
+
+```js
+create_goal({
+  objective: "all tests pass",
+  budget: 5,
+});
+```
+
+- `objective` required, concrete and verifiable.
+- `budget` required, in USD.
+
+### Hooks
+
+Optional shell commands that run before/after each iteration:
 
 ```js
 create_goal({
@@ -78,25 +92,16 @@ create_goal({
 });
 ```
 
-- `budget` required, in USD.
-- `objective` required, should be concrete and verifiable.
-- `beforeEach` / `afterEach` optional shell commands run before/after each iteration.
-
 ## Safety
 
 - **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
-- **Auto-continue limit.** 50 automatic continuations maximum as a guardrail.
-- **Completion audit.** A separate evaluator (subagent with fresh context) must confirm the goal is met before the agent can mark it complete. The agent can't grade its own homework.
-- **Evaluation modes.** Adversarial for subjective goals like "refactor for clarity." Self mode for objective evidence (tests pass, build succeeds).
+- **Auto-continue limit.** 50 automatic continuations maximum.
+- **Completion audit.** A separate evaluator confirms the goal is met — the agent can't grade its own homework. Use `adversarial` mode for subjective goals, `self` for objective evidence.
 - **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked.
 
 ## How It Works
 
-**Ideas backlog.** Promising-but-untried approaches are logged and surfaced in continuation prompts to prevent random walk.
-
-**Iteration journal.** Every attempt is recorded in `.pi/goal/<id>/journal.md` with hypothesis, result, cost, and commit hash.
-
-**Compaction-aware.** Goal state survives context compaction.
+The agent keeps working until the goal is met or the budget runs out. Each attempt is checkpointed with git — you can inspect or roll back any iteration. A separate evaluator checks the result before allowing completion.
 
 See [DESIGN.md](DESIGN.md) for the full API design, convergence criteria, and prior art.
 
