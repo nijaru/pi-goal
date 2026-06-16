@@ -163,24 +163,7 @@ Panel (full): history, metrics, cost breakdown, hooks, ideas
 
 ## Influences
 
-### Loop Patterns
-
-- **Ralph Loop** (Geoffrey Huntley, 2025) — `while :; do cat PROMPT.md | claude; done`. Fresh context each iteration, task completion via completion promise or test results. Ralph proved the simplest viable loop. Pi-goal inherits the "loop until done" skeleton but adds persistent state (Ralph discards context each iteration).
-
-- **Autoresearch** (Karpathy, 2025) — Single mutable file, metric-driven, git-native keep/revert, never stops. Pi-goal inherits git-native checkpointing and the keep/revert pattern, but adds explicit stopping criteria.
-
-- **Ralph Loop Optimizer** (haoran-ni) — Bridges Ralph and autoresearch: domain-agnostic optimization with Ralph-style orchestration + autoresearch-style evaluation logging. Closest prior art to pi-goal's design.
-
-### Goal Implementations
-
-- **Codex CLI /goal** — Server-side SQLite persistence, model self-decides completion. Pi-goal uses file-based persistence (same idea, local-first). Codex has no hard cost budget; pi-goal does.
-
-- **Claude Code /goal** — Separate evaluator model (Haiku) with fresh context window. Confirmed the "never self-evaluate" pattern. Pi-goal uses the same fresh-context principle with subagent.
-
-### Evaluation Research
-
-- **Agent-as-a-Judge** (ICML 2025) — Agentic evaluation with intermediate feedback outperforms single LLM calls. Validates pi-goal's adversarial evaluation approach.
-- **SELFGOAL** — Hierarchical goal decomposition (future consideration).
+Codex CLI (completion audit, blocked audit), Claude Code (external evaluator), Karpathy autoresearch (git-native keep/revert). Detailed prior-art analysis in `pi-extensions-research/research/pi-goal/influences-prior-art.md`.
 
 ## File Structure
 

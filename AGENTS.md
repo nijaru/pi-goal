@@ -8,12 +8,19 @@ See DESIGN.md for the full API design and implementation notes.
 
 ## Architecture
 
-- Single extension, ~300-400 lines
+- Single extension, ~900 lines
 - Entry: `extensions/pi-goal/index.ts`
 - Files stored in `.pi/goal/<goal-id>/`
 - Git-native keep/revert (when in a git repo)
 - Adversarial evaluation (different model than agent)
 - Ideas backlog to prevent random walk
+
+## Scope
+
+- No unbounded loops, budget always required
+- No orchestration, that's pi-workflows
+- No agent definitions, that's pi-subagents
+- No separate memory extension, iteration log is built in
 
 ## Stack
 
