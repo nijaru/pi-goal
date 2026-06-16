@@ -24,7 +24,7 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 - `create_goal` — set objective + budget (agent or user)
 - `get_goal` — read current goal state
 - `update_goal` — mark complete or blocked
-- `evaluate_goal` — optional evaluation (self or adversarial)
+- `evaluate_goal` — optional evaluation (self or adversarial). Adversarial mode: instruct evaluator to look for gaps and failures, not confirm completeness; check generalization beyond the specific scenario; report what's missing, not just what's present. An unnecessary finding is cheaper than a missed failure.
 - `log_iteration` — record iteration, git commit/revert
 - `log_idea` — ideas backlog (anti-random-walk)
 
@@ -48,6 +48,8 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 
 - **Completion audit** — built into continuation template, agent verifies before marking complete
 - **Decomposition signal** — if the cumulative diff exceeds ~1500 lines or touches >5 files, do not mark complete. Instead, decompose the remaining work into atomic tasks and log them.
+- **Anti-overfitting** — completion audit must verify the solution works for the general case, not just the specific scenario that prompted it. Edge cases, different input shapes, fragile assumptions — check before marking complete.
+- **Evaluator calibration** — adversarial evaluators should be instructed to find gaps, not confirm completeness. Agents systematically grade their own work too generously (NeurIPS 2024). The evaluator's job is to be skeptical by default.
 - **Blocked audit** — 3 consecutive turns of same blocker before marking blocked
 - **Meta-prompting** — agent can create goals for itself and subagents
 - **Git-native** — commit on keep, reset on revert
