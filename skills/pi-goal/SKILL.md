@@ -47,6 +47,7 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 ## Key Patterns
 
 - **Completion audit** — built into continuation template, agent verifies before marking complete
+- **Decomposition signal** — if the cumulative diff exceeds ~1500 lines or touches >5 files, do not mark complete. Instead, decompose the remaining work into atomic tasks and log them.
 - **Blocked audit** — 3 consecutive turns of same blocker before marking blocked
 - **Meta-prompting** — agent can create goals for itself and subagents
 - **Git-native** — commit on keep, reset on revert

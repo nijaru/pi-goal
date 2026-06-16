@@ -252,6 +252,7 @@ The audit process:
 6. Only after the evaluator confirms 'achieved' may you call update_goal with status 'complete'.
 
 Do not self-assess completion inline. Fresh context (subagent or fresh turn) corrects for self-preferential bias. If the evaluator returns 'not_yet', continue working.
+- If the cumulative diff exceeds ~1500 lines or touches >5 files, do not mark complete. Instead, decompose the remaining work into atomic tasks and log them.
 
 Blocked audit:
 - Do not call update_goal with status "blocked" the first time a blocker appears.
