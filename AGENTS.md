@@ -4,7 +4,7 @@ Persistent loop for pi. Define what "done" means, agent works until it's done.
 
 ## Design
 
-See DESIGN.md for the full API design and implementation notes.
+API examples, lifecycle, convergence, and file formats are documented in the code and README.
 
 ## Architecture
 

@@ -66,8 +66,6 @@ The agent calls these automatically. You don't need to use them directly:
 
 The agent keeps working until the goal is met or the budget runs out. Each attempt is checkpointed with git. You can inspect or roll back any iteration. A separate evaluator checks the result before allowing completion.
 
-See [DESIGN.md](DESIGN.md) for the full API design, convergence criteria, and prior art.
-
 ## Goal Lifecycle
 
 ```
