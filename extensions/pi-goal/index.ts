@@ -35,7 +35,7 @@ import { randomUUID } from "node:crypto";
 const GOAL_DIR = ".pi/goal";
 const MAX_AUTO_CONTINUE = 50;
 const BLOCKED_THRESHOLD = 3; // consecutive turns before marking blocked
-const TERMINAL_TURNS = 3; // auto-clear widget after this many turns in terminal state
+const TERMINAL_TURNS = 1; // auto-clear widget after this many turns in terminal state
 const SETTLED_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,7 @@ interface Runtime {
   autoTurns: number;
   timer: ReturnType<typeof setTimeout> | null;
   pendingMsg: string | null;
+  /** Turns since goal entered terminal state (for auto-clear) */
   terminalTurns: number;
 }
 
@@ -419,7 +420,6 @@ export default function piGoal(pi: ExtensionAPI) {
     }
 
     if (g.status !== "active") return;
-    rt.terminalTurns = 0;
     const ideasPath = goalPaths(ctx.cwd, g.id).ideas;
     return {
       systemPrompt: event.systemPrompt + [
@@ -475,7 +475,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
       rt.goal = goal;
       rt.autoTurns = 0;
-      rt.terminalTurns = 0;
 
       const p = goalPaths(ctx.cwd, id);
       fs.mkdirSync(p.dir, { recursive: true });
@@ -546,7 +545,7 @@ export default function piGoal(pi: ExtensionAPI) {
         rt.goal = null;
         rt.autoTurns = 0;
         rt.terminalTurns = 0;
-        updateWidget(ctx);
+        if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
         return ok("🗑️ Goal cleared. You can now create a new one with create_goal.", {});
       }
 
@@ -584,7 +583,6 @@ export default function piGoal(pi: ExtensionAPI) {
           `Iterations: ${g.iterations.length} | Cost: ${fmt$(g.costUsed)}`,
           "",
           "Report final usage to the user: iterations completed, total cost, and time spent.",
-          "The goal display stays visible until the user creates a new goal or clears it.",
         ].join("\n"), { goal: g });
       }
 
@@ -913,7 +911,10 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       if (cmd === "clear") {
-        cancelResume(); rt.goal = null; rt.autoTurns = 0; rt.terminalTurns = 0;
+        cancelResume();
+        rt.goal = null;
+        rt.autoTurns = 0;
+        rt.terminalTurns = 0;
         if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
         ctx.ui.notify("Cleared", "info");
         return;

@@ -200,6 +200,7 @@ describe("pi-goal extension", () => {
     const ctx = createMockCtx();
     await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
     await updateGoal.execute("c2", { status: "complete" }, undefined, undefined, ctx);
+    // Goal is in terminal state, should be rejected
     const r = await updateGoal.execute("c3", { status: "complete" }, undefined, undefined, ctx);
     expect(r.content[0].text).toContain("Goal is complete");
   });
@@ -293,29 +294,33 @@ describe("pi-goal extension", () => {
     expect(r.details.mode).toBe("adversarial");
   });
 
-  test("before_agent_start auto-clears terminal goal after threshold", async () => {
+  test("update_goal shows completed state for 1 turn then auto-clears", async () => {
     const mod = await import("./index.ts");
     const pi = createMockAPI();
     mod.default(pi as any);
 
     const createGoal = pi.getTool("create_goal");
     const updateGoal = pi.getTool("update_goal");
+    const getGoal = pi.getTool("get_goal");
     const ctx = createMockCtx();
     ctx.hasUI = true;
     await createGoal.execute("c1", { objective: "test", budget: 5 }, undefined, undefined, ctx);
     await updateGoal.execute("c2", { status: "complete" }, undefined, undefined, ctx);
 
-    // Reset mock to clear calls from setup
-    ctx.ui.setWidget.mockClear();
+    // Widget should still be set (showing completed state)
+    expect(ctx.ui.setWidget).toHaveBeenCalledWith("goal", expect.any(Function));
 
+    // Goal should still exist
+    const state1 = await getGoal.execute("c3", {}, undefined, undefined, ctx);
+    expect(state1.content[0].text).toContain("complete");
+
+    // Simulate 1 agent start - should auto-clear
     const handler = pi.handlers.get("before_agent_start");
-    // Simulate TERMINAL_TURNS (3) agent starts
     handler({ systemPrompt: "" }, ctx);
-    handler({ systemPrompt: "" }, ctx);
-    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
 
-    handler({ systemPrompt: "" }, ctx);
-    expect(ctx.ui.setWidget).toHaveBeenCalledWith("goal", undefined);
+    // Now goal should be gone
+    const state2 = await getGoal.execute("c4", {}, undefined, undefined, ctx);
+    expect(state2.content[0].text).toContain("No active goal");
   });
 
   test("log_idea returns error when no goal", async () => {
