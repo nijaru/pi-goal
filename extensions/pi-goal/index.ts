@@ -151,6 +151,34 @@ function isGitRepo(cwd: string): boolean {
   return fs.existsSync(path.join(cwd, ".git"));
 }
 
+/** Add .pi/goal/ to .git/info/exclude if not already present. */
+function ensureGitExcluded(cwd: string): void {
+  if (!isGitRepo(cwd)) return;
+  const excludeFile = path.join(cwd, ".git", "info", "exclude");
+  try {
+    const content = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, "utf-8") : "";
+    if (content.split("\n").some(l => l.trim() === ".pi/goal/")) return;
+    fs.appendFileSync(excludeFile, "\n.pi/goal/\n");
+  } catch { /* best effort */ }
+}
+
+/** Delete goal dirs older than GC_DAYS. Runs on create_goal. */
+const GC_DAYS = 30;
+function gcOldGoals(cwd: string): void {
+  const base = path.join(cwd, GOAL_DIR);
+  if (!fs.existsSync(base)) return;
+  const cutoff = Date.now() - GC_DAYS * 86_400_000;
+  for (const e of fs.readdirSync(base, { withFileTypes: true })) {
+    if (!e.isDirectory()) continue;
+    try {
+      const g = JSON.parse(fs.readFileSync(goalPaths(cwd, e.name).state, "utf-8")) as GoalState;
+      if (new Date(g.updatedAt).getTime() < cutoff) {
+        fs.rmSync(goalPaths(cwd, e.name).dir, { recursive: true, force: true });
+      }
+    } catch { /* skip corrupt or missing */ }
+  }
+}
+
 // Validation helpers
 function requireGoal(g: GoalState | null): string | null {
   return g ? null : "❌ No active goal. Call create_goal first.";
@@ -339,6 +367,7 @@ export default function piGoal(pi: ExtensionAPI) {
   const reconstruct = (ctx: ExtensionContext) => {
     rt.goal = readGoal(ctx.cwd);
     rt.autoTurns = 0;
+    ensureGitExcluded(ctx.cwd);
     updateWidget(ctx);
   };
 
@@ -462,6 +491,8 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       cancelResume();
+      gcOldGoals(ctx.cwd);
+      ensureGitExcluded(ctx.cwd);
       const id = randomUUID().slice(0, 12);
       const ts = now();
 
