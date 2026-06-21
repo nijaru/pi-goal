@@ -73,6 +73,8 @@ interface GoalState {
   beforeEach?: string;
   /** Shell command run after each iteration (optional) */
   afterEach?: string;
+  /** Total auto-continues across sessions (for MAX_AUTO_CONTINUE cap) */
+  autoTurns?: number;
 }
 
 interface Runtime {
@@ -185,7 +187,8 @@ function requireGoal(g: GoalState | null): string | null {
 }
 function requireActive(g: GoalState | null): string | null {
   if (!g) return "❌ No active goal. Call create_goal first.";
-  if (g.status !== "active") return `❌ Goal is ${g.status}. Call update_goal with status "cleared" to clear it, or resume via the /goal command.`;
+  if (g.status === "paused") return `❌ Goal is paused. Resume via the /goal command.`;
+  if (g.status !== "active") return `❌ Goal is ${g.status}. Call update_goal with status "cleared" to clear it.`;
   return null;
 }
 
@@ -365,8 +368,17 @@ export default function piGoal(pi: ExtensionAPI) {
   };
 
   const reconstruct = (ctx: ExtensionContext) => {
-    rt.goal = readGoal(ctx.cwd);
-    rt.autoTurns = 0;
+    const g = readGoal(ctx.cwd);
+    // Skip goals in terminal states — nothing to resume
+    if (g && (g.status === "complete" || g.status === "blocked" || g.status === "budget_limited")) {
+      rt.goal = null;
+      rt.autoTurns = 0;
+      rt.terminalTurns = 0;
+      if (ctx.hasUI) ctx.ui.setWidget("goal", undefined);
+      return;
+    }
+    rt.goal = g;
+    rt.autoTurns = g?.autoTurns ?? 0;
     ensureGitExcluded(ctx.cwd);
     updateWidget(ctx);
   };
@@ -413,6 +425,8 @@ export default function piGoal(pi: ExtensionAPI) {
       const m = rt.pendingMsg;
       cancelResume();
       rt.autoTurns++;
+      if (rt.goal) rt.goal.autoTurns = rt.autoTurns;
+      save(ctx.cwd);
       pi.sendUserMessage(m);
     }, SETTLED_MS);
   };
@@ -422,7 +436,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("session_start", (_, ctx) => reconstruct(ctx));
   pi.on("session_tree", (_, ctx) => reconstruct(ctx));
   pi.on("session_shutdown", (_, ctx) => { cancelResume(); if (ctx.hasUI) ctx.ui.setWidget("goal", undefined); });
-  pi.on("agent_start", () => { rt.autoTurns = 0; cancelResume(); });
+  pi.on("agent_start", () => { cancelResume(); });
   pi.on("agent_end", (_, ctx) => { if (rt.goal?.status === "active") scheduleResume(ctx); });
 
   pi.on("session_before_compact", (event, ctx) => {
