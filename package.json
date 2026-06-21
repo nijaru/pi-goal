@@ -37,11 +37,11 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "^5.0.0",
     "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0",
-    "@sinclair/typebox": "^0.34.41"
+    "@earendil-works/pi-coding-agent": "^0.79.9",
+    "@earendil-works/pi-tui": "^0.79.9",
+    "@sinclair/typebox": "^0.34.41",
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
   }
 }
