@@ -447,7 +447,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
   pi.on("session_compact", (_, ctx) => { if (rt.goal?.status === "active") scheduleResume(ctx); });
 
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", (_event, ctx) => {
     const g = rt.goal;
     if (!g) return;
 
@@ -464,18 +464,25 @@ export default function piGoal(pi: ExtensionAPI) {
 
     if (g.status !== "active") return;
     const ideasPath = goalPaths(ctx.cwd, g.id).ideas;
+    // Inject goal context as a user message instead of modifying the system prompt.
+    // System prompt modifications bust provider-level prefix caching because
+    // budget/iteration count change every turn. Custom messages become role:"user"
+    // in the LLM context (see convertToLlm in messages.js).
     return {
-      systemPrompt: event.systemPrompt + [
-        "",
-        "## Goal Mode (ACTIVE)",
-        `Objective: ${g.objective}`,
-        `Budget: ${fmt$(g.budget - g.costUsed)} remaining (${g.iterations.length} iterations)`,
-        "",
-        "You are pursuing a persistent goal. The continuation prompt includes a completion audit — verify against actual state before marking complete.",
-        `- Ideas backlog: ${ideasPath}`,
-        "",
-        "Tools: create_goal, get_goal, update_goal, log_iteration, log_idea, evaluate_goal",
-      ].join("\n"),
+      message: {
+        customType: "goal-context",
+        content: [
+          "## Goal Mode (ACTIVE)",
+          `Objective: ${g.objective}`,
+          `Budget: ${fmt$(g.budget - g.costUsed)} remaining (${g.iterations.length} iterations)`,
+          "",
+          "You are pursuing a persistent goal. The continuation prompt includes a completion audit — verify against actual state before marking complete.",
+          `- Ideas backlog: ${ideasPath}`,
+          "",
+          "Tools: create_goal, get_goal, update_goal, log_iteration, log_idea, evaluate_goal",
+        ].join("\n"),
+        display: false,
+      },
     };
   });
 
