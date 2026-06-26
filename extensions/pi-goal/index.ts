@@ -73,8 +73,6 @@ interface GoalState {
   beforeEach?: string;
   /** Shell command run after each iteration (optional) */
   afterEach?: string;
-  /** Total auto-continues across sessions (for MAX_AUTO_CONTINUE cap) */
-  autoTurns?: number;
 }
 
 interface Runtime {
@@ -188,6 +186,7 @@ function requireGoal(g: GoalState | null): string | null {
 function requireActive(g: GoalState | null): string | null {
   if (!g) return "❌ No active goal. Call create_goal first.";
   if (g.status === "paused") return `❌ Goal is paused. Resume via the /goal command.`;
+  if (g.status === "budget_limited") return `❌ Goal is budget-limited. Resume via /goal resume after increasing budget, or clear with update_goal status "cleared".`;
   if (g.status !== "active") return `❌ Goal is ${g.status}. Call update_goal with status "cleared" to clear it.`;
   return null;
 }
@@ -364,13 +363,16 @@ export default function piGoal(pi: ExtensionAPI) {
     if (!rt.goal) return;
     const p = goalPaths(cwd, rt.goal.id);
     fs.mkdirSync(p.dir, { recursive: true });
-    fs.writeFileSync(p.state, JSON.stringify(rt.goal, null, 2));
+    // Don't persist autoTurns — it's a per-session counter
+    const { autoTurns: _, ...toSave } = rt.goal as GoalState & { autoTurns?: number };
+    fs.writeFileSync(p.state, JSON.stringify(toSave, null, 2));
   };
 
   const reconstruct = (ctx: ExtensionContext) => {
     const g = readGoal(ctx.cwd);
-    // Skip goals in terminal states — nothing to resume
-    if (g && (g.status === "complete" || g.status === "blocked" || g.status === "budget_limited")) {
+    // Only truly terminal states block reconstruction (complete/blocked are final)
+    // budget_limited is resumable — user can increase budget or clear
+    if (g && (g.status === "complete" || g.status === "blocked")) {
       rt.goal = null;
       rt.autoTurns = 0;
       rt.terminalTurns = 0;
@@ -378,7 +380,7 @@ export default function piGoal(pi: ExtensionAPI) {
       return;
     }
     rt.goal = g;
-    rt.autoTurns = g?.autoTurns ?? 0;
+    rt.autoTurns = 0; // per-session counter, not lifetime
     ensureGitExcluded(ctx.cwd);
     updateWidget(ctx);
   };
@@ -421,11 +423,20 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.timer = setTimeout(() => {
       if (!rt.pendingMsg || !rt.goal || rt.goal.status !== "active") { cancelResume(); return; }
       if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-      if (rt.autoTurns >= MAX_AUTO_CONTINUE) { cancelResume(); ctx.ui.notify("Goal auto-continue limit reached", "info"); return; }
+      if (rt.autoTurns >= MAX_AUTO_CONTINUE) {
+        cancelResume();
+        if (rt.goal) {
+          rt.goal.status = "paused";
+          rt.goal.updatedAt = now();
+          save(ctx.cwd);
+          updateWidget(ctx);
+        }
+        ctx.ui.notify("Goal auto-continue limit reached — paused. Use /goal resume to continue.", "info");
+        return;
+      }
       const m = rt.pendingMsg;
       cancelResume();
       rt.autoTurns++;
-      if (rt.goal) rt.goal.autoTurns = rt.autoTurns;
       save(ctx.cwd);
       pi.sendUserMessage(m);
     }, SETTLED_MS);
@@ -452,7 +463,8 @@ export default function piGoal(pi: ExtensionAPI) {
     if (!g) return;
 
     // Terminal state: count turns and auto-clear after threshold
-    if (g.status === "complete" || g.status === "blocked" || g.status === "budget_limited") {
+    // budget_limited is NOT terminal — it's resumable via /goal resume
+    if (g.status === "complete" || g.status === "blocked") {
       rt.terminalTurns++;
       if (rt.terminalTurns >= TERMINAL_TURNS) {
         rt.goal = null;
@@ -530,7 +542,9 @@ export default function piGoal(pi: ExtensionAPI) {
 
       const p = goalPaths(ctx.cwd, id);
       fs.mkdirSync(p.dir, { recursive: true });
-      fs.writeFileSync(p.state, JSON.stringify(goal, null, 2));
+      // Don't persist autoTurns — it's a per-session counter
+      const { autoTurns: _, ...goalToSave } = goal as GoalState & { autoTurns?: number };
+      fs.writeFileSync(p.state, JSON.stringify(goalToSave, null, 2));
       fs.writeFileSync(p.journal, journalHeader(goal));
       fs.writeFileSync(p.ideas, "# Ideas\n\n");
       updateWidget(ctx);
@@ -955,8 +969,8 @@ export default function piGoal(pi: ExtensionAPI) {
       }
 
       if (cmd === "resume") {
-        if (rt.goal?.status !== "paused") { ctx.ui.notify("No paused goal", "warning"); return; }
-        rt.goal.status = "active"; rt.goal.blockedCount = 0; rt.goal.lastBlocker = null; rt.goal.updatedAt = now(); save(ctx.cwd); updateWidget(ctx);
+        if (rt.goal?.status !== "paused" && rt.goal?.status !== "budget_limited") { ctx.ui.notify("No paused or budget-limited goal", "warning"); return; }
+        rt.goal.status = "active"; rt.goal.blockedCount = 0; rt.goal.lastBlocker = null; rt.autoTurns = 0; rt.goal.updatedAt = now(); save(ctx.cwd); updateWidget(ctx);
         ctx.ui.notify("Resumed — fresh blocked audit", "info");
         scheduleResume(ctx);
         return;
@@ -964,6 +978,10 @@ export default function piGoal(pi: ExtensionAPI) {
 
       if (cmd === "clear") {
         cancelResume();
+        if (rt.goal) {
+          const dir = goalPaths(ctx.cwd, rt.goal.id).dir;
+          try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        }
         rt.goal = null;
         rt.autoTurns = 0;
         rt.terminalTurns = 0;
