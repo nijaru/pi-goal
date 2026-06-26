@@ -4,7 +4,7 @@ description: >
   Persistent loop for pi. Define what "done" means, agent works until it's done.
   Use when the user says "goal", "optimize", "iterate until", "keep working until",
   or wants to run an autonomous optimization loop.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # pi-goal
@@ -16,8 +16,8 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 - `/goal <objective>` — create a goal
 - `/goal status` — show current goal
 - `/goal pause` — pause the goal loop
-- `/goal resume` — resume a paused goal
-- `/goal clear` — clear the goal
+- `/goal resume` — resume a paused or budget-limited goal
+- `/goal clear` — clear the goal (deletes goal directory)
 
 ## Tools
 
@@ -51,6 +51,8 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 - **Anti-overfitting** — completion audit must verify the solution works for the general case, not just the specific scenario that prompted it. Edge cases, different input shapes, fragile assumptions — check before marking complete.
 - **Evaluator calibration** — adversarial evaluators should be instructed to find gaps, not confirm completeness. Agents systematically grade their own work too generously (NeurIPS 2024). The evaluator's job is to be skeptical by default.
 - **Blocked audit** — 3 consecutive turns of same blocker before marking blocked
+- **Auto-continue** — per-session limit (50 turns). Limit resets on session start and resume. Hitting the limit pauses the goal (doesn't brick it).
+- **Budget-limited resumable** — goals that exhaust their budget can be resumed via `/goal resume` (unlike Codex, where budget-limited is terminal). Increase budget or clear and recreate.
 - **Meta-prompting** — agent can create goals for itself and subagents
 - **Git-native** — commit on keep, reset on revert
 - **Ideas backlog** — log promising approaches to prevent random walk
