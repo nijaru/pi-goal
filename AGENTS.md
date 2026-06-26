@@ -39,7 +39,10 @@ bun test
 | `log_idea` | `idea` | Prevents random walk |
 | `evaluate_goal` | `mode`, `analysis?`, `verdict?` | `self` or `adversarial` |
 
-Goal statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused`; `paused` → `active`.
+Goal statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused`.
+`paused` and `budget_limited` → `active` (via `/goal resume`).
+`complete` and `blocked` are terminal.
+Auto-continue is per-session (50 turns), resets on session start and resume.
 
 ## Key Patterns
 
