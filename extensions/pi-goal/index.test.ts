@@ -257,12 +257,12 @@ describe("pi-goal extension", () => {
 
     const evaluateGoal = pi.getTool("evaluate_goal");
     const ctx = createMockCtx();
-    const result = await evaluateGoal.execute("c1", { analysis: "test", verdict: "not_yet", reasoning: "test" }, undefined, undefined, ctx);
+    const result = await evaluateGoal.execute("c1", {}, undefined, undefined, ctx);
 
     expect(result.content[0].text).toContain("No active goal");
   });
 
-  test("evaluate_goal self mode returns verdict", async () => {
+  test("evaluate_goal returns adversarial prompt", async () => {
     const mod = await import("./index.ts");
     const pi = createMockAPI();
     mod.default(pi as any);
@@ -272,22 +272,7 @@ describe("pi-goal extension", () => {
     const ctx = createMockCtx();
     await createGoal.execute("c1", { objective: "tests pass", budget: 5 }, undefined, undefined, ctx);
 
-    const r = await evaluateGoal.execute("c2", { mode: "self", analysis: "All tests pass", verdict: "achieved", reasoning: "Verified via bun test" }, undefined, undefined, ctx);
-    expect(r.content[0].text).toContain("achieved");
-    expect(r.content[0].text).toContain("update_goal with status 'complete'");
-  });
-
-  test("evaluate_goal adversarial returns prompt for subagent", async () => {
-    const mod = await import("./index.ts");
-    const pi = createMockAPI();
-    mod.default(pi as any);
-
-    const createGoal = pi.getTool("create_goal");
-    const evaluateGoal = pi.getTool("evaluate_goal");
-    const ctx = createMockCtx();
-    await createGoal.execute("c1", { objective: "tests pass", budget: 5 }, undefined, undefined, ctx);
-
-    const r = await evaluateGoal.execute("c2", { mode: "adversarial" }, undefined, undefined, ctx);
+    const r = await evaluateGoal.execute("c2", {}, undefined, undefined, ctx);
     expect(r.content[0].text).toContain("subagent");
     expect(r.content[0].text).toContain("followUp");
     expect(r.content[0].text).toContain("tests pass");

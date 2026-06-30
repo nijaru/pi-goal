@@ -4,7 +4,7 @@ description: >
   Persistent loop for pi. Define what "done" means, agent works until it's done.
   Use when the user says "goal", "optimize", "iterate until", "keep working until",
   or wants to run an autonomous optimization loop.
-version: 0.3.0
+version: 0.0.1
 ---
 
 # pi-goal
@@ -24,7 +24,7 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 - `create_goal` — set objective + budget (agent or user)
 - `get_goal` — read current goal state
 - `update_goal` — mark complete or blocked
-- `evaluate_goal` — optional evaluation (self or adversarial). Adversarial mode: instruct evaluator to look for gaps and failures, not confirm completeness; check generalization beyond the specific scenario; report what's missing, not just what's present. An unnecessary finding is cheaper than a missed failure.
+- `evaluate_goal` — generate an adversarial evaluation prompt for fresh-context review. The evaluator looks for gaps and failures, not confirms completeness. Only mark complete after the evaluator confirms achievement.
 - `log_iteration` — record iteration, git commit/revert
 - `log_idea` — ideas backlog (anti-random-walk)
 
@@ -46,13 +46,11 @@ Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
 
 ## Key Patterns
 
-- **Completion audit** — built into continuation template, agent verifies before marking complete
-- **Decomposition signal** — if the cumulative diff exceeds ~1500 lines or touches >5 files, do not mark complete. Instead, decompose the remaining work into atomic tasks and log them.
-- **Anti-overfitting** — completion audit must verify the solution works for the general case, not just the specific scenario that prompted it. Edge cases, different input shapes, fragile assumptions — check before marking complete.
-- **Evaluator calibration** — adversarial evaluators should be instructed to find gaps, not confirm completeness. Agents systematically grade their own work too generously (NeurIPS 2024). The evaluator's job is to be skeptical by default.
-- **Blocked audit** — 3 consecutive turns of same blocker before marking blocked
+- **Completion audit** — call evaluate_goal before marking complete. The adversarial prompt checks for gaps, weak evidence, and unverified claims. Fresh context (subagent or fresh turn) corrects for self-preferential bias.
+- **Blocked audit** — call update_goal({status: "blocked"}) each time you hit a blocker. The tool tracks consecutive calls with the same blocker description — it marks blocked after the 3rd call. This gives the agent intermediate feedback (1/3, 2/3) before actually blocking.
 - **Auto-continue** — per-session limit (50 turns). Limit resets on session start and resume. Hitting the limit pauses the goal (doesn't brick it).
 - **Budget-limited resumable** — goals that exhaust their budget can be resumed via `/goal resume` (unlike Codex, where budget-limited is terminal). Increase budget or clear and recreate.
-- **Meta-prompting** — agent can create goals for itself and subagents
+- **Stagnation detection** — warns when 3 consecutive iterations have the same hypothesis or are all reverted.
 - **Git-native** — commit on keep, reset on revert
 - **Ideas backlog** — log promising approaches to prevent random walk
+- **Meta-prompting** — agent can create goals for itself and subagents
