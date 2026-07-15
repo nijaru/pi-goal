@@ -1,8 +1,8 @@
 {
   "name": "pi-goal",
-  "version": "0.0.1",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Persistent loop for pi — define what done means, agent works until it's done.",
+  "description": "Session-scoped, bounded autonomous goals for pi with evidence-gated completion.",
   "keywords": [
     "pi-package",
     "pi",
@@ -21,7 +21,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/pi-goal/index.ts"
     ],
     "skills": [
       "./skills"
@@ -33,14 +33,12 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-ai": "^0.79.9",
     "@earendil-works/pi-coding-agent": "^0.79.9",
     "@earendil-works/pi-tui": "^0.79.9",
-    "@sinclair/typebox": "^0.34.41",
     "@types/bun": "latest",
     "typescript": "^5.0.0"
   }

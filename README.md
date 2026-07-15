@@ -1,8 +1,8 @@
 # pi-goal
 
-Persistent autonomous goals for pi. Define what "done" means, and the agent works until it's done.
+Session-scoped autonomous goals for pi. Define a verifiable completion condition and pi continues working across turns until it is complete, paused, blocked, or bounded by usage.
 
-Goal mode, autoresearch, and "just keep prompting" are the same loop. pi-goal formalizes it with persistent state, git-native checkpoints, and a separate evaluator.
+State lives in Pi session custom entries, so resume and `/tree` are branch-aware and forks remain independent. pi-goal never commits, resets, cleans, or runs model-supplied shell hooks.
 
 ## Installation
 
@@ -12,85 +12,60 @@ pi install git:github.com/nijaru/pi-goal
 
 ## Quick Start
 
-```
-> /goal all tests pass and lint is clean
-
-✅ Goal created
-Objective: all tests pass
-Budget: $5.00
+```text
+/goal --budget 5 --max-turns 50 all tests pass and lint is clean
 ```
 
-A status widget shows progress:
-
-```
-─── Goal ───────────────────────────────
-  ◉ active  iter: 3  cost: $0.12 / $5.00
-  all tests pass and lint is clean
-```
-
-Each iteration, the agent makes a change, runs your hooks, and logs the result. In a git repo, changes are committed on success and reverted on failure.
+`/goal` starts the loop directly. It does not ask the model to create a second goal or invent a budget. With no arguments, `/goal` shows status.
 
 ## User Commands
 
-Type these in the pi TUI:
-
 | Command | Description |
 |---------|-------------|
-| `/goal <objective>` | Create a new goal |
-| `/goal status` | Show current goal |
+| `/goal` | Show current goal, usage, elapsed time, and evaluation |
+| `/goal <condition>` | Start with the default $5 / 50-turn limits |
+| `/goal --budget 5 --max-turns 20 <condition>` | Start with explicit limits |
+| `/goal edit <condition>` | Replace the current goal |
 | `/goal pause` | Pause the loop |
-| `/goal resume` | Resume a paused goal |
-| `/goal clear` | Clear the current goal |
+| `/goal resume [--budget N] [--max-turns N]` | Resume a paused, blocked, or limited goal; both budget and turn headroom are required |
+| `/goal clear` | Clear the goal and persist a tombstone |
+
+Pause, resume, clear, and limit changes are deliberately user-command-only.
 
 ## Agent Tools
 
-The agent calls these automatically. You don't need to use them directly:
-
 | Tool | Description |
 |------|-------------|
-| `create_goal` | Set objective + budget |
-| `get_goal` | Read current goal state |
-| `update_goal` | Mark complete or blocked |
-| `log_iteration` | Record attempt, checkpoint if in git repo |
-| `log_idea` | Log approach to ideas backlog |
-| `evaluate_goal` | Self or adversarial evaluation |
+| `create_goal` | Create a session-scoped goal with USD and turn bounds |
+| `get_goal` | Read lifecycle, provider usage, evaluation, blocker, and progress |
+| `update_goal` | Mark the goal `complete` or `blocked` only |
+| `evaluate_goal` | Request an adversarial evaluation prompt or record its verdict |
+| `log_iteration` | Record a bounded attempt and evidence; no Git mutation |
+| `log_idea` | Add a bounded idea to the session-persisted backlog |
 
-## Safety
+## Completion and safety
 
-- **No unbounded loops.** Budget is required. The loop stops when it's exhausted.
-- **Auto-continue limit.** 50 automatic continuations maximum.
-- **Completion audit.** A separate evaluator confirms the goal is met. The agent can't grade its own homework. Use `adversarial` mode for subjective goals, `self` for objective evidence.
-- **Blocked audit.** After 3 consecutive turns of the same blocker, the goal is marked blocked.
+- **Evidence gate.** `update_goal({status: "complete"})` requires `evaluate_goal` to have recorded `achieved` with non-empty evidence for the current goal revision. Workspace-mutating tools, `user_bash`, session restart, and `/tree` reconstruction invalidate that evaluation; requesting an evaluation and then completing it does not.
+- **Evaluator contract.** The extension returns an adversarial evaluation prompt, but the caller must provide a genuinely fresh, read-only evaluator context (the `subagent` handoff is supported while evaluation is pending) and judge the returned evidence. Any other workspace-mutating tool activity invalidates the request. pi-goal does not cryptographically guarantee evaluator independence.
+- **Authoritative usage.** At `agent_start`, usage is bound to the goal active for that run. Each `turn_end` accounts one provider turn exactly once. The USD threshold is checked after the provider call, so one call may overshoot the budget; `maxTurns` aborts before another turn.
+- **Session scope.** State is stored with `pi.appendEntry()` and reconstructed from the current session branch. `/tree` reconstructs state but does not schedule a turn until a prompt is submitted in the selected branch. Compaction may append a state snapshot while preserving Pi's normal summary. Continuations are queued through Pi's agent lifecycle, so Pi performs its auto-compaction check before draining them; there is no detached timer racing compaction.
+- **Workflow safety.** While a goal is active, pi-workflows calls with background/detached execution are blocked. Use `background: false` so the workflow cannot race goal continuation.
+- **No destructive automation.** Iteration labels are logical `kept`/`reverted` experiment results. pi-goal never runs Git commands or arbitrary shell hooks.
+- **Serialized and bounded state.** Goal mutations are queued. Persisted notes, evidence, arrays, numbers, and limits are validated or bounded during reconstruction. Prompt data blocks escape embedded closing markers and are explicitly untrusted.
 
-## How It Works
+## Lifecycle
 
-The agent keeps working until the goal is met or the budget runs out. Each attempt is checkpointed with git. You can inspect or roll back any iteration. A separate evaluator checks the result before allowing completion.
-
-## Goal Lifecycle
-
-```
-active → complete       (goal met, verified via completion audit)
-active → blocked        (same blocker for 3+ consecutive turns)
-active → budget_limited (budget exhausted)
-active → paused         (/goal pause)
-paused → active         (/goal resume)
-```
-
-## File Structure
-
-```
-.pi/goal/<goal-id>/
-├── state.json     # goal state (budget, status, lifecycle)
-├── journal.md     # iteration log
-└── ideas.md       # promising-but-untried approaches
+```text
+active → complete       (current-revision evaluation says achieved)
+active → blocked        (external input/dependency required)
+active → budget_limited (USD or turn limit reached)
+active → paused         (/goal pause or user interruption)
+paused/blocked/limited → active (/goal resume with both limits available)
+any goal state → cleared (/goal clear or replacement)
 ```
 
-## Influences
+## Persistence
 
-- **Codex CLI** inspired the completion audit, blocked audit, and agent-set goals
-- **Claude Code** demonstrated the external evaluator pattern
-- **Karpathy autoresearch** established the git-native keep/revert pattern and the metric loop
-
-## License
+The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported.
 
 MIT

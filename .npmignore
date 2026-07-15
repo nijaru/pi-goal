@@ -1,4 +1,5 @@
 node_modules
+**/*.test.ts
 bun.lock
 ai/
 review.md

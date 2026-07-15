@@ -1,56 +1,49 @@
 ---
 name: pi-goal
 description: >
-  Persistent loop for pi. Define what "done" means, agent works until it's done.
-  Use when the user says "goal", "optimize", "iterate until", "keep working until",
-  or wants to run an autonomous optimization loop.
-version: 0.0.1
+  Session-scoped persistent goals for pi. Define what "done" means, and the
+  agent works until it is complete, paused, blocked, or bounded.
+version: 0.3.0
 ---
 
 # pi-goal
 
-Persistent loop that tries, evaluates, keeps or reverts, and repeats until done.
+Use this bounded continuation loop for long-running work with a concrete, verifiable finish line. Use a normal prompt for one-shot tasks.
 
 ## Commands
 
-- `/goal <objective>` — create a goal
-- `/goal status` — show current goal
-- `/goal pause` — pause the goal loop
-- `/goal resume` — resume a paused or budget-limited goal
-- `/goal clear` — clear the goal (deletes goal directory)
+- `/goal` — show status
+- `/goal <objective>` — create and start with default `$5` / `50` turns
+- `/goal --budget N --max-turns N <objective>` — create with explicit limits
+- `/goal edit <objective>` — replace the current goal
+- `/goal pause` — pause
+- `/goal resume [--budget N] [--max-turns N]` — resume a paused, blocked, or limited goal; both budget and turn headroom are required
+- `/goal clear` — clear and persist a tombstone
+
+Pause, resume, clear, and budget/maxTurns changes are user-command-only.
 
 ## Tools
 
-- `create_goal` — set objective + budget (agent or user)
-- `get_goal` — read current goal state
-- `update_goal` — mark complete or blocked
-- `evaluate_goal` — generate an adversarial evaluation prompt for fresh-context review. The evaluator looks for gaps and failures, not confirms completeness. Only mark complete after the evaluator confirms achievement.
-- `log_iteration` — record iteration, git commit/revert
-- `log_idea` — ideas backlog (anti-random-walk)
+- `create_goal` — create a session-scoped goal; `budget` and optional `maxTurns` are bounds
+- `get_goal` — inspect state, provider usage, evaluation, blocker, and progress
+- `update_goal` — mark only `complete` or `blocked`; it cannot pause, resume, clear, or change limits
+- `evaluate_goal` — request an adversarial evaluation prompt, then record `achieved`, `not_yet`, or `error`
+- `log_iteration` — record a bounded logical attempt and evidence
+- `log_idea` — record a bounded idea
 
-## When to Use
+## Operating rules
 
-- User wants to optimize something (performance, coverage, etc.)
-- User wants to iterate until a condition is met
-- User wants autonomous work on a long-running task
-- User says "keep working until X"
-- Agent should set goals for itself or subagents (meta-prompting)
+1. Use one objective with a measurable stopping condition and verification surface.
+2. Call `log_iteration` after meaningful attempts and include command/test output.
+3. Before completion, request `evaluate_goal` with no verdict. The caller must give its prompt to a genuinely fresh, read-only evaluator (the `subagent` handoff is supported while evaluation is pending), record that evaluator's verdict and non-empty evidence, then call `update_goal` with `complete` only if it says `achieved` for the current revision. Any other workspace-mutating tool activity invalidates the request; evaluator independence remains caller-enforced.
+4. Use `blocked` when user input or an external dependency is required; include the concrete blocker.
+5. Usage is scoped to the goal active at `agent_start` and accounted once per `turn_end`. The USD threshold is post-provider-call, so one call may overshoot. `maxTurns` aborts before another turn.
+6. Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate a recorded evaluation. `evaluate_goal` followed by `update_goal complete` does not.
+7. While a goal is active, invoke pi-workflows only with `background: false`; detached/background workflows are blocked to prevent continuation races.
+8. `kept` and `reverted` are logical labels. pi-goal never mutates Git or runs arbitrary shell hooks.
 
-## How It Works
+## Lifecycle
 
-1. Create a goal with an objective and budget
-2. Continuation template includes completion audit (adversarial-by-design)
-3. Agent makes changes, logs iterations
-4. Agent calls update_goal when objective is verified against actual state
-5. Repeat until complete, blocked, or budget exhausted
+`active` → `complete` | `blocked` | `budget_limited` | `paused` | `cleared`.
 
-## Key Patterns
-
-- **Completion audit** — call evaluate_goal before marking complete. The adversarial prompt checks for gaps, weak evidence, and unverified claims. Fresh context (subagent or fresh turn) corrects for self-preferential bias.
-- **Blocked audit** — call update_goal({status: "blocked"}) each time you hit a blocker. The tool tracks consecutive calls with the same blocker description — it marks blocked after the 3rd call. This gives the agent intermediate feedback (1/3, 2/3) before actually blocking.
-- **Auto-continue** — per-session limit (50 turns). Limit resets on session start and resume. Hitting the limit pauses the goal (doesn't brick it).
-- **Budget-limited resumable** — goals that exhaust their budget can be resumed via `/goal resume` (unlike Codex, where budget-limited is terminal). Increase budget or clear and recreate.
-- **Stagnation detection** — warns when 3 consecutive iterations have the same hypothesis or are all reverted.
-- **Git-native** — commit on keep, reset on revert
-- **Ideas backlog** — log promising approaches to prevent random walk
-- **Meta-prompting** — agent can create goals for itself and subagents
+Goals are persisted as Pi session custom entries and reconstructed from the current branch. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstructs the selected state but does not schedule work before the selected prompt is resubmitted, and invalidates prior evaluation evidence. Compaction keeps Pi's normal summary. Continuations use Pi's queued agent-lifecycle follow-up path, which lets Pi complete its auto-compaction check before draining them.
