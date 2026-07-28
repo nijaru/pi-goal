@@ -563,7 +563,7 @@ describe("pi-goal extension", () => {
     await evaluate.execute("2", {}, undefined, undefined, ctx);
     const evaluationRequest = await evaluate.execute("2b", {}, undefined, undefined, ctx);
     const nonce = evaluationRequest.details.goal.evaluationRequested.nonce;
-    const evaluatorHandoff = await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "subagent-1", toolName: "subagent", input: { task: `read-only evaluation ${nonce}` } }, ctx);
+    const evaluatorHandoff = await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "subagent-1", toolName: "subagent", input: { agent: "reviewer", task: `read-only evaluation ${nonce}` } }, ctx);
     expect(evaluatorHandoff).toBeUndefined();
     await expect(evaluate.execute("3", { verdict: "achieved", reason: "verified", evidence: " " }, undefined, undefined, ctx)).rejects.toThrow("Non-empty evidence");
     await evaluate.execute("4", { verdict: "achieved", reason: "verified", evidence: "bun test: 1 pass" }, undefined, undefined, ctx);
@@ -578,6 +578,34 @@ describe("pi-goal extension", () => {
     await evaluate.execute("10", { verdict: "achieved", reason: "verified after bash", evidence: "clean" }, undefined, undefined, ctx);
     const done = await update.execute("11", { status: "complete" }, undefined, undefined, ctx);
     expect(done.details.goal.status).toBe("complete");
+  });
+
+  test("does not exempt parallel or token-smuggling subagent calls from evaluation invalidation", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    const create = pi.getTool("create_goal");
+    const evaluate = pi.getTool("evaluate_goal");
+    await create.execute("1", { objective: "strict evaluator handoff", budget: 5 }, undefined, undefined, ctx);
+    await evaluate.execute("2", {}, undefined, undefined, ctx);
+    const nonce = (await evaluate.execute("3", {}, undefined, undefined, ctx)).details.goal.evaluationRequested.nonce;
+    await pi.handlers.get("tool_call")({
+      type: "tool_call",
+      toolCallId: "subagent-1",
+      toolName: "subagent",
+      input: { tasks: [{ agent: "reviewer", task: `read-only evaluation ${nonce}` }] },
+    }, ctx);
+    expect((await pi.getTool("get_goal").execute("4", {}, undefined, undefined, ctx)).details.goal.evaluationRequested).toBeUndefined();
+
+    await evaluate.execute("5", {}, undefined, undefined, ctx);
+    const nextNonce = (await evaluate.execute("6", {}, undefined, undefined, ctx)).details.goal.evaluationRequested.nonce;
+    await pi.handlers.get("tool_call")({
+      type: "tool_call",
+      toolCallId: "subagent-2",
+      toolName: "subagent",
+      input: { agent: "reviewer", task: "read-only evaluation", cwd: nextNonce },
+    }, ctx);
+    expect((await pi.getTool("get_goal").execute("7", {}, undefined, undefined, ctx)).details.goal.evaluationRequested).toBeUndefined();
   });
 
   test("escapes embedded data-block closing markers", async () => {

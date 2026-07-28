@@ -502,18 +502,26 @@ function hasToolActivity(messages: any[]): boolean {
   });
 }
 
+function isEvaluationHandoff(event: ToolCallEvent, goal: GoalState | null): boolean {
+  if (event.toolName !== "subagent" || !goal?.evaluationRequested || !isRecord(event.input)) return false;
+  // Only a single evaluator task can use the pending token. Parallel and
+  // chained workers are not a trustworthy fresh-context handoff, and putting
+  // the token in another field must not grant an exemption.
+  if (event.input.action !== undefined || event.input.tasks !== undefined || event.input.chain !== undefined) return false;
+  return typeof event.input.agent === "string"
+    && typeof event.input.task === "string"
+    && event.input.task.includes(goal.evaluationRequested.nonce);
+}
+
 function isWorkspaceMutationTool(event: ToolCallEvent, goal: GoalState | null): boolean {
   // Bash and unknown custom tools can mutate the workspace in ways the
   // extension cannot inspect. Prefer invalidating an evaluation unnecessarily
   // over allowing a stale achieved verdict after an unseen edit.
   if (event.toolName === "read" || event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls" || event.toolName === "get_goal") return false;
   if (["evaluate_goal", "log_iteration", "log_idea", "update_goal", "create_goal"].includes(event.toolName)) return false;
-  // `subagent` is exempt only for the exact pending evaluation handoff token.
-  // Arbitrary workers remain mutation-capable and invalidate the request.
-  if (event.toolName === "subagent" && goal?.evaluationRequested) {
-    const encoded = JSON.stringify(event.input);
-    return !encoded.includes(goal.evaluationRequested.nonce);
-  }
+  // A single evaluator task is exempt for the exact pending handoff token.
+  // The caller still owns the fresh/read-only evaluator contract.
+  if (isEvaluationHandoff(event, goal)) return false;
   return true;
 }
 
