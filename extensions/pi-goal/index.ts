@@ -14,11 +14,15 @@ import type {
   AgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
+  SessionCompactEvent,
+  SessionTreeEvent,
   ToolCallEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 
 const STATE_ENTRY = "pi-goal/state";
@@ -513,14 +517,32 @@ function isWorkspaceMutationTool(event: ToolCallEvent, goal: GoalState | null): 
   return true;
 }
 
-function turnUsage(message: any): { input: number; output: number; total: number; cost: number } {
-  const usage = message?.role === "assistant" ? message.usage : undefined;
+interface ProviderUsage {
+  input: number;
+  output: number;
+  total: number;
+  cost: number;
+}
+
+function providerUsage(usage: Usage | undefined): ProviderUsage {
   return {
     input: isNonNegativeNumber(usage?.input) ? usage.input : 0,
     output: isNonNegativeNumber(usage?.output) ? usage.output : 0,
     total: isNonNegativeNumber(usage?.totalTokens) ? usage.totalTokens : 0,
     cost: isNonNegativeNumber(usage?.cost?.total) ? usage.cost.total : 0,
   };
+}
+
+function turnUsage(message: any): ProviderUsage {
+  return message?.role === "assistant" ? providerUsage(message.usage) : providerUsage(undefined);
+}
+
+function recordProviderUsage(goal: GoalState, usage: ProviderUsage, countTurn = false): void {
+  if (countTurn) goal.usage.turns = boundedAdd(goal.usage.turns, 1);
+  goal.usage.inputTokens = boundedAdd(goal.usage.inputTokens, usage.input);
+  goal.usage.outputTokens = boundedAdd(goal.usage.outputTokens, usage.output);
+  goal.usage.totalTokens = boundedAdd(goal.usage.totalTokens, usage.total);
+  goal.usage.cost = boundedAdd(goal.usage.cost, usage.cost);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +597,37 @@ export default function piGoal(pi: ExtensionAPI) {
       return true;
     }
     return false;
+  }
+
+  function stopAfterLimit(goal: GoalState, ctx: ExtensionContext): void {
+    // Preserve a queued user prompt, especially in RPC mode where aborting can
+    // consume it. The next provider turn is allowed to run as normal work, but
+    // no longer counts toward the limited goal.
+    const userWorkQueued = rt.userInputQueued && ctx.hasPendingMessages();
+    rt.userInputQueued = userWorkQueued;
+    rt.stopNextAgentStart = !userWorkQueued;
+    if (!userWorkQueued) ctx.abort();
+    ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use /goal resume with higher budget and maxTurns headroom to continue.`, "info");
+  }
+
+  function finalAssistantStopReason(messages: any[]): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "assistant") return messages[i].stopReason;
+    }
+    return undefined;
+  }
+
+  function accountAuxiliaryUsage(usage: Usage | undefined, ctx: ExtensionContext): Promise<void> {
+    if (!usage) return Promise.resolve();
+    return mutate(() => {
+      const goal = rt.goal;
+      if (!goal || goal.status !== "active") return;
+      recordProviderUsage(goal, providerUsage(usage));
+      const limited = markLimitIfNeeded(goal);
+      persistPatch(pi, goal);
+      updateWidget(ctx);
+      if (limited) stopAfterLimit(goal, ctx);
+    });
   }
 
   function queueContinuation(ctx: ExtensionContext): void {
@@ -699,9 +752,10 @@ export default function piGoal(pi: ExtensionAPI) {
   // Tree navigation reconstructs state for the selected branch, but does not
   // start a turn until the user submits a prompt in that branch. The working
   // tree may not match the selected branch, so prior evaluation is stale.
-  pi.on("session_tree", (_event, ctx) => {
+  pi.on("session_tree", async (event: SessionTreeEvent, ctx) => {
     reconstruct(ctx, false, false);
     invalidateRestoredEvaluation(ctx);
+    await accountAuxiliaryUsage(event.summaryEntry?.usage, ctx);
   });
   pi.on("session_shutdown", () => {
     rt.activeRun = null;
@@ -795,15 +849,13 @@ export default function piGoal(pi: ExtensionAPI) {
       // An aborted provider attempt after a reached limit is not another goal
       // turn and must not inflate usage beyond the hard ceiling.
       if (goal.status === "budget_limited") return;
-      const usage = turnUsage(event.message);
-      goal.usage.turns = boundedAdd(goal.usage.turns, 1);
-      goal.usage.inputTokens = boundedAdd(goal.usage.inputTokens, usage.input);
-      goal.usage.outputTokens = boundedAdd(goal.usage.outputTokens, usage.output);
-      goal.usage.totalTokens = boundedAdd(goal.usage.totalTokens, usage.total);
-      goal.usage.cost = boundedAdd(goal.usage.cost, usage.cost);
-
-      // Account at each provider turn. A provider call can put cost over
-      // budget; the monetary threshold is checked after that call returns.
+      // Account the parent provider turn and any nested model usage returned by
+      // tools. A provider call can put cost over budget; the threshold is
+      // checked after that call returns.
+      recordProviderUsage(goal, turnUsage(event.message), true);
+      for (const toolResult of event.toolResults ?? []) {
+        recordProviderUsage(goal, providerUsage(toolResult.usage));
+      }
       const limited = currentGoal?.id === run.goalId && markLimitIfNeeded(goal);
       // If a command replaced or cleared the goal during this run, preserve
       // the old goal's accounting on its tombstone, then append the current
@@ -811,16 +863,7 @@ export default function piGoal(pi: ExtensionAPI) {
       persistPatch(pi, goal);
       if (currentGoal && currentGoal.id !== run.goalId) persistPatch(pi, currentGoal);
       updateWidget(ctx);
-      if (limited) {
-        // Preserve a queued user prompt, especially in RPC mode where aborting
-        // can consume it. The next provider turn is allowed to run as normal
-        // work, but no longer counts toward the limited goal.
-        const userWorkQueued = ctx.hasPendingMessages();
-        rt.userInputQueued = userWorkQueued;
-        rt.stopNextAgentStart = !userWorkQueued;
-        if (!userWorkQueued) ctx.abort();
-        ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use /goal resume with higher budget and maxTurns headroom to continue.`, "info");
-      }
+      if (limited) stopAfterLimit(goal, ctx);
     });
   });
 
@@ -833,7 +876,9 @@ export default function piGoal(pi: ExtensionAPI) {
       if (!run) return;
       runGoalId = run.goalId;
       const goal = rt.goal;
-      const interrupted = event.messages.some((message: any) => message?.role === "assistant" && message.stopReason === "aborted");
+      const finalStopReason = finalAssistantStopReason(event.messages);
+      const interrupted = finalStopReason === "aborted";
+      const failed = finalStopReason === "error";
 
       // A goal created by a tool during this run did not own the preceding
       // provider turn. It still pauses on an interruption, but otherwise only
@@ -846,7 +891,7 @@ export default function piGoal(pi: ExtensionAPI) {
           persistPatch(pi, goal);
           updateWidget(ctx);
           ctx.ui.notify("Goal paused after interruption. Use /goal resume to continue.", "info");
-        } else if (goal?.status === "active" && run.hadToolActivity) {
+        } else if (goal?.status === "active" && run.hadToolActivity && !failed) {
           persistPatch(pi, goal);
           updateWidget(ctx);
           shouldContinue = true;
@@ -868,7 +913,7 @@ export default function piGoal(pi: ExtensionAPI) {
       goal.updatedAt = now();
       persistPatch(pi, goal);
       updateWidget(ctx);
-      shouldContinue = goal.status === "active" && run.hadToolActivity;
+      shouldContinue = goal.status === "active" && run.hadToolActivity && !failed;
     });
     if (shouldContinue && rt.goal?.status === "active" && (!runGoalId || rt.goal.id === runGoalId)) queueContinuation(ctx);
   });
@@ -922,6 +967,10 @@ export default function piGoal(pi: ExtensionAPI) {
     return undefined;
   });
 
+  pi.on("session_compact", async (event: SessionCompactEvent, ctx) => {
+    await accountAuxiliaryUsage(event.compactionEntry.usage, ctx);
+  });
+
   const renderText = (result: any) => new Text(result.content?.[0]?.type === "text" ? result.content[0].text : "", 0, 0);
 
   // -------------------------------------------------------------------------
@@ -934,9 +983,9 @@ export default function piGoal(pi: ExtensionAPI) {
     description: "Create a persistent, session-scoped goal. The loop continues across turns until completion, pause, block, or a budget/turn limit.",
     promptSnippet: "Create a persistent goal to pursue autonomously",
     promptGuidelines: [
-      "Call only when the user explicitly requests a persistent goal.",
-      "Use one concrete, verifiable objective with a clear stopping condition.",
-      "Budget is an authoritative USD ceiling based on provider-reported usage; maxTurns is a hard safety limit.",
+      "Call create_goal only when the user explicitly requests a persistent goal.",
+      "Use create_goal with one concrete, verifiable objective and a clear stopping condition.",
+      "Set create_goal budget as an authoritative USD ceiling based on provider-reported usage; maxTurns is a hard safety limit.",
     ],
     parameters: Type.Object({
       objective: Type.String({ description: "Concrete objective to pursue (maximum 4000 characters)." }),
@@ -991,9 +1040,9 @@ export default function piGoal(pi: ExtensionAPI) {
     description: "Mark the current goal complete or blocked. Pause, resume, clear, and limit changes are user-command-only.",
     promptSnippet: "Mark a goal complete or blocked",
     promptGuidelines: [
-      "Only mark complete after evaluate_goal records achieved with non-empty evidence for the current revision.",
-      "Use blocked immediately when user input or an external dependency is required; include the concrete blocker.",
-      "Pause, resume, clear, and budget/maxTurns changes are controlled by the user through /goal commands.",
+      "Call update_goal with complete only after evaluate_goal records achieved with non-empty evidence for the current revision.",
+      "Call update_goal with blocked when user input or an external dependency is required; include the concrete blocker.",
+      "update_goal cannot pause, resume, clear, or change limits; the user controls those through /goal commands.",
     ],
     parameters: Type.Object({
       status: StringEnum(["complete", "blocked"] as const),
@@ -1037,8 +1086,8 @@ export default function piGoal(pi: ExtensionAPI) {
     description: "Request an adversarial evaluation or record its verdict. The caller must provide a fresh context; completion requires achieved with non-empty evidence for the current revision.",
     promptSnippet: "Evaluate goal completion against current evidence",
     promptGuidelines: [
-      "First call with no verdict and give the returned prompt to a genuinely fresh-context evaluator; the caller must enforce that separation.",
-      "Then call with that evaluator's verdict, reason, and non-empty evidence for achieved. Do not invent an achieved verdict.",
+      "Call evaluate_goal without a verdict first, then give its prompt to a genuinely fresh-context evaluator; the caller must enforce that separation.",
+      "Call evaluate_goal with that evaluator's verdict and reason; include non-empty evidence for achieved and do not invent an achieved verdict.",
     ],
     parameters: Type.Object({
       verdict: Type.Optional(StringEnum(["achieved", "not_yet", "error"] as const)),
@@ -1088,9 +1137,9 @@ export default function piGoal(pi: ExtensionAPI) {
     description: "Record an attempted approach and its evidence. kept/reverted are logical experiment labels; pi-goal never mutates Git or executes shell hooks.",
     promptSnippet: "Record an iteration and evidence",
     promptGuidelines: [
-      "Call after each meaningful attempt, including failed attempts.",
-      "Include actual test or command output in evidence when available.",
-      "The cost field is an optional estimate only; authoritative usage comes from Pi assistant message usage.",
+      "Call log_iteration after each meaningful attempt, including failed attempts.",
+      "Include actual test or command output in log_iteration evidence when available.",
+      "The log_iteration cost field is an optional estimate only; authoritative usage comes from Pi provider usage.",
     ],
     parameters: Type.Object({
       hypothesis: Type.String({ description: "What you tried and why." }),

@@ -44,6 +44,15 @@ const assistant = (cost: number, input = 10, output = 5, totalTokens = 15, toolC
   stopReason: "stop",
 });
 
+const providerUsage = (cost: number, input = 2, output = 3, totalTokens = 5) => ({
+  input,
+  output,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+});
+
 async function startRun(pi: any, ctx: any): Promise<void> {
   pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
   await Promise.resolve();
@@ -79,6 +88,9 @@ describe("pi-goal extension", () => {
       "create_goal", "get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea",
     ]));
     expect(pi.getTool("update_goal").description).toContain("user-command-only");
+    for (const toolName of ["create_goal", "update_goal", "evaluate_goal", "log_iteration"]) {
+      expect(pi.getTool(toolName).promptGuidelines.every((guideline: string) => guideline.includes(toolName))).toBe(true);
+    }
     const ctx = createMockCtx(pi.entries);
     await pi.getTool("create_goal").execute("1", { objective: "x", budget: 5 }, undefined, undefined, ctx);
     await expect(pi.getTool("update_goal").execute("2", { status: "paused" }, undefined, undefined, ctx)).rejects.toThrow("only accepts complete or blocked");
@@ -363,6 +375,77 @@ describe("pi-goal extension", () => {
     expect(state.details.goal.usage.cost).toBe(1.5);
     expect(state.details.goal.usage.totalTokens).toBe(30);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("accounts nested tool, compaction, and branch-summary usage without extra turns", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "all provider usage", budget: 1.25, maxTurns: 3 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0.1);
+    await pi.handlers.get("turn_end")({
+      type: "turn_end",
+      turnIndex: 0,
+      message,
+      toolResults: [{ usage: providerUsage(0.2) }],
+    }, ctx);
+    let state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.usage.turns).toBe(1);
+    expect(state.details.goal.usage.cost).toBeCloseTo(0.3);
+
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(0.4) },
+      fromExtension: false,
+      reason: "threshold",
+      willRetry: false,
+    }, ctx);
+    state = await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx);
+    expect(state.details.goal.usage.turns).toBe(1);
+    expect(state.details.goal.usage.cost).toBeCloseTo(0.7);
+
+    await pi.handlers.get("session_tree")({
+      type: "session_tree",
+      newLeafId: "leaf",
+      oldLeafId: null,
+      summaryEntry: { usage: providerUsage(0.6) },
+    }, ctx);
+    state = await pi.getTool("get_goal").execute("4", {}, undefined, undefined, ctx);
+    expect(state.details.goal.status).toBe("budget_limited");
+    expect(state.details.goal.usage.turns).toBe(1);
+    expect(state.details.goal.usage.cost).toBeCloseTo(1.3);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("stops a compaction-limited goal instead of treating its follow-up as user work", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "stop queued continuation", budget: 1 }, undefined, undefined, ctx);
+    ctx.hasPendingMessages.mockReturnValue(true);
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(1.1) },
+      fromExtension: false,
+      reason: "threshold",
+      willRetry: false,
+    }, ctx);
+    const state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.status).toBe("budget_limited");
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not queue continuation after a provider error", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "recover only after success", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1, 10, 5, 15, true), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
   test("does not charge a goal created after agent_start or resurrect a replaced goal", async () => {
