@@ -418,6 +418,34 @@ describe("pi-goal extension", () => {
     expect(ctx.abort).toHaveBeenCalledTimes(1);
   });
 
+  test("accounts usage reported inside nested tool details", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "nested model usage", budget: 0.25 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0.1);
+    await pi.handlers.get("turn_end")({
+      type: "turn_end",
+      turnIndex: 0,
+      message,
+      toolResults: [{
+        toolName: "subagent",
+        details: {
+          mode: "single",
+          results: [{ usage: { input: 20, output: 10, cost: 0.2, contextTokens: 30 } }],
+        },
+      }],
+    }, ctx);
+    const state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.status).toBe("budget_limited");
+    expect(state.details.goal.usage.turns).toBe(1);
+    expect(state.details.goal.usage.cost).toBeCloseTo(0.3);
+    expect(state.details.goal.usage.inputTokens).toBe(30);
+    expect(state.details.goal.usage.outputTokens).toBe(15);
+    expect(state.details.goal.usage.totalTokens).toBe(45);
+  });
+
   test("stops a compaction-limited goal instead of treating its follow-up as user work", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -701,6 +729,29 @@ describe("pi-goal extension", () => {
     pi2.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx2);
     const state = await pi2.getTool("get_goal").execute("2", {}, undefined, undefined, ctx2);
     expect(state.content[0].text).toBe("No active goal.");
+  });
+
+  test("replays a completed goal clear and later goal after restart", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries, "session-a");
+    const create = pi.getTool("create_goal");
+    const evaluate = pi.getTool("evaluate_goal");
+    const update = pi.getTool("update_goal");
+    await create.execute("1", { objective: "complete then clear", budget: 5 }, undefined, undefined, ctx);
+    await evaluate.execute("2", {}, undefined, undefined, ctx);
+    await evaluate.execute("3", { verdict: "achieved", reason: "verified", evidence: "all checks passed" }, undefined, undefined, ctx);
+    await update.execute("4", { status: "complete" }, undefined, undefined, ctx);
+    await pi.getCommand("goal").handler("clear", ctx);
+    await pi.getCommand("goal").handler("next goal", ctx);
+
+    const restored = createMockAPI(pi.entries);
+    extension(restored as any);
+    const restoredCtx = createMockCtx(restored.entries, "session-a");
+    restored.handlers.get("session_start")({ type: "session_start", reason: "startup" }, restoredCtx);
+    const state = await restored.getTool("get_goal").execute("5", {}, undefined, undefined, restoredCtx);
+    expect(state.details.goal.objective).toBe("next goal");
+    expect(state.details.goal.status).toBe("active");
   });
 
   test("filters stale goal context after replacement", async () => {

@@ -254,7 +254,7 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
 
 function isMonotonicState(previous: GoalState, next: GoalState): boolean {
   if (previous.id !== next.id || previous.sessionId !== next.sessionId) return false;
-  if (next.status !== "complete" && previous.status === "complete") return false;
+  if (previous.status === "complete" && next.status !== "complete" && next.status !== "cleared") return false;
   if (next.status !== "cleared" && previous.status === "cleared") return false;
   if (next.budget < previous.budget || next.maxTurns < previous.maxTurns || next.revision < previous.revision) return false;
   const previousUsage = previous.usage;
@@ -532,17 +532,44 @@ interface ProviderUsage {
   cost: number;
 }
 
-function providerUsage(usage: Usage | undefined): ProviderUsage {
+function providerUsage(usage: unknown): ProviderUsage {
+  if (!isRecord(usage)) return { input: 0, output: 0, total: 0, cost: 0 };
+  const input = isNonNegativeNumber(usage.input) ? usage.input : 0;
+  const output = isNonNegativeNumber(usage.output) ? usage.output : 0;
+  const total = isNonNegativeNumber(usage.totalTokens) ? usage.totalTokens : boundedAdd(input, output);
+  const cost = isRecord(usage.cost)
+    ? (isNonNegativeNumber(usage.cost.total) ? usage.cost.total : 0)
+    : (isNonNegativeNumber(usage.cost) ? usage.cost : 0);
+  return { input, output, total, cost };
+}
+
+function addProviderUsage(left: ProviderUsage, right: ProviderUsage): ProviderUsage {
   return {
-    input: isNonNegativeNumber(usage?.input) ? usage.input : 0,
-    output: isNonNegativeNumber(usage?.output) ? usage.output : 0,
-    total: isNonNegativeNumber(usage?.totalTokens) ? usage.totalTokens : 0,
-    cost: isNonNegativeNumber(usage?.cost?.total) ? usage.cost.total : 0,
+    input: boundedAdd(left.input, right.input),
+    output: boundedAdd(left.output, right.output),
+    total: boundedAdd(left.total, right.total),
+    cost: boundedAdd(left.cost, right.cost),
   };
 }
 
+function toolResultUsage(toolResult: unknown): ProviderUsage {
+  if (!isRecord(toolResult)) return { input: 0, output: 0, total: 0, cost: 0 };
+  // ToolResultMessage.usage is the canonical location when a tool exposes it.
+  if (toolResult.usage !== undefined) return providerUsage(toolResult.usage);
+
+  // pi-subagents reports child model usage in details.results[*].usage rather
+  // than ToolResultMessage.usage. Aggregate that shape without counting a
+  // duplicate top-level value.
+  const details = toolResult.details;
+  if (!isRecord(details) || !Array.isArray(details.results)) return { input: 0, output: 0, total: 0, cost: 0 };
+  return details.results.reduce<ProviderUsage>((total, result) => {
+    if (!isRecord(result)) return total;
+    return addProviderUsage(total, providerUsage(result.usage));
+  }, { input: 0, output: 0, total: 0, cost: 0 });
+}
+
 function turnUsage(message: any): ProviderUsage {
-  return message?.role === "assistant" ? providerUsage(message.usage) : providerUsage(undefined);
+  return message?.role === "assistant" ? providerUsage(message.usage) : { input: 0, output: 0, total: 0, cost: 0 };
 }
 
 function recordProviderUsage(goal: GoalState, usage: ProviderUsage, countTurn = false): void {
@@ -862,7 +889,7 @@ export default function piGoal(pi: ExtensionAPI) {
       // checked after that call returns.
       recordProviderUsage(goal, turnUsage(event.message), true);
       for (const toolResult of event.toolResults ?? []) {
-        recordProviderUsage(goal, providerUsage(toolResult.usage));
+        recordProviderUsage(goal, toolResultUsage(toolResult));
       }
       const limited = currentGoal?.id === run.goalId && markLimitIfNeeded(goal);
       // If a command replaced or cleared the goal during this run, preserve
