@@ -43,6 +43,8 @@ Pause, resume, clear, and limit changes are deliberately user-command-only.
 | `log_iteration` | Record a bounded attempt and evidence; no Git mutation |
 | `log_idea` | Add a bounded idea to the session-persisted backlog |
 
+`create_goal` remains available so an explicit user request can start a goal. The other five tools are dynamically active only while a goal has `active` status; their runtime guards remain in place.
+
 ## Completion and safety
 
 - **Evidence gate.** `update_goal({status: "complete"})` requires `evaluate_goal` to have recorded `achieved` with non-empty evidence for the current goal revision. Workspace-mutating tools, `user_bash`, session restart, and `/tree` reconstruction invalidate that evaluation; requesting an evaluation and then completing it does not.

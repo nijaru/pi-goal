@@ -5,6 +5,7 @@ const createMockAPI = (branch: any[] = []) => {
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const handlers = new Map<string, any>();
+  const activeTools = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
   return {
     registerTool: mock((tool: any) => tools.set(tool.name, tool)),
     registerCommand: mock((name: string, command: any) => commands.set(name, command)),
@@ -13,11 +14,17 @@ const createMockAPI = (branch: any[] = []) => {
     sendUserMessage: mock(),
     appendEntry: mock((customType: string, data: unknown) => branch.push({ type: "custom", customType, data })),
     exec: mock(),
+    getActiveTools: mock(() => [...activeTools]),
+    setActiveTools: mock((names: string[]) => {
+      activeTools.clear();
+      for (const name of names) activeTools.add(name);
+    }),
     getTool: (name: string) => tools.get(name),
     getCommand: (name: string) => commands.get(name),
     tools,
     commands,
     handlers,
+    activeTools,
     entries: branch,
   };
 };
@@ -80,21 +87,32 @@ beforeEach(async () => {
 afterEach(() => vi.useRealTimers());
 
 describe("pi-goal extension", () => {
-  test("registers six tools and exposes only complete/blocked to the model", async () => {
+  test("registers six tools and exposes goal tools only while a goal is active", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     expect(pi.tools.size).toBe(6);
     expect([...pi.tools.keys()]).toEqual(expect.arrayContaining([
       "create_goal", "get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea",
     ]));
+    expect(pi.activeTools).toContain("create_goal");
+    for (const toolName of ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"]) {
+      expect(pi.activeTools).not.toContain(toolName);
+    }
+    expect(pi.getTool("create_goal").description).toContain("explicitly requests");
     expect(pi.getTool("update_goal").description).toContain("user-command-only");
     for (const toolName of ["create_goal", "update_goal", "evaluate_goal", "log_iteration"]) {
       expect(pi.getTool(toolName).promptGuidelines.every((guideline: string) => guideline.includes(toolName))).toBe(true);
     }
     const ctx = createMockCtx(pi.entries);
+    await expect(pi.getTool("log_iteration").execute("0", { hypothesis: "x", result: "x", status: "kept" }, undefined, undefined, ctx)).rejects.toThrow("No active goal");
     await pi.getTool("create_goal").execute("1", { objective: "x", budget: 5 }, undefined, undefined, ctx);
+    for (const toolName of ["create_goal", "get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"]) {
+      expect(pi.activeTools).toContain(toolName);
+    }
     await expect(pi.getTool("update_goal").execute("2", { status: "paused" }, undefined, undefined, ctx)).rejects.toThrow("only accepts complete or blocked");
     await expect(pi.getTool("update_goal").execute("3", { status: "blocked", budget: 99 }, undefined, undefined, ctx)).rejects.toThrow("blocker");
+    await pi.getTool("update_goal").execute("4", { status: "blocked", blocker: "waiting" }, undefined, undefined, ctx);
+    expect(pi.activeTools).toEqual(new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "create_goal"]));
   });
 
   test("creates a validated session-persisted goal with bounded defaults", async () => {

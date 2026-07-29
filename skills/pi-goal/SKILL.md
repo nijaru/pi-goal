@@ -31,6 +31,8 @@ Pause, resume, clear, and budget/maxTurns changes are user-command-only.
 - `log_iteration` — record a bounded logical attempt and evidence
 - `log_idea` — record a bounded idea
 
+`create_goal` remains visible for explicit user requests. `get_goal`, `update_goal`, `evaluate_goal`, `log_iteration`, and `log_idea` are dynamically hidden unless a goal is active; runtime guards still reject invalid direct calls.
+
 ## Operating rules
 
 1. Use one objective with a measurable stopping condition and verification surface.

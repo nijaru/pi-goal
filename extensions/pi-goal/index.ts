@@ -39,6 +39,7 @@ const MAX_TEXT = 1_000;
 const MAX_EVIDENCE = 2_000;
 const MAX_ITERATIONS = 500;
 const MAX_IDEAS = 100;
+const GOAL_PROGRESS_TOOLS = ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"] as const;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -594,6 +595,18 @@ export default function piGoal(pi: ExtensionAPI) {
     return next;
   }
 
+  function syncActiveTools(): void {
+    const current = pi.getActiveTools();
+    const next = new Set(current);
+    for (const name of GOAL_PROGRESS_TOOLS) next.delete(name);
+    next.add("create_goal");
+    if (rt.goal?.status === "active") {
+      for (const name of GOAL_PROGRESS_TOOLS) next.add(name);
+    }
+    if (current.length === next.size && current.every(name => next.has(name))) return;
+    pi.setActiveTools([...next]);
+  }
+
   function updateWidget(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     const goal = rt.goal;
@@ -623,12 +636,14 @@ export default function piGoal(pi: ExtensionAPI) {
       goal.status = "budget_limited";
       goal.stopReason = "USD budget exhausted";
       touch(goal);
+      syncActiveTools();
       return true;
     }
     if (goal.usage.turns >= goal.maxTurns) {
       goal.status = "budget_limited";
       goal.stopReason = "turn limit reached";
       touch(goal);
+      syncActiveTools();
       return true;
     }
     return false;
@@ -746,6 +761,7 @@ export default function piGoal(pi: ExtensionAPI) {
       updatedAt: now(),
     };
     rt.goal = goal;
+    syncActiveTools();
     persist(pi, goal);
     updateWidget(ctx);
     return goal;
@@ -769,6 +785,7 @@ export default function piGoal(pi: ExtensionAPI) {
       persistPatch(pi, rt.goal);
       rt.goal = null;
     }
+    syncActiveTools();
     updateWidget(ctx);
   };
 
@@ -797,6 +814,8 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.stopNextAgentStart = false;
     rt.userInputQueued = false;
     rt.startupPending = false;
+    rt.goal = null;
+    syncActiveTools();
   });
   pi.on("input", event => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
@@ -828,6 +847,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("before_agent_start", (_event, _ctx) => {
     // User input is tracked by the input hook so queued prompts can be
     // distinguished from automatic retries/follow-ups.
+    syncActiveTools();
     const goal = rt.goal;
     if (!goal || goal.status !== "active") return;
     return {
@@ -923,6 +943,7 @@ export default function piGoal(pi: ExtensionAPI) {
           goal.status = "paused";
           goal.stopReason = "interrupted by the user";
           touch(goal);
+          syncActiveTools();
           persistPatch(pi, goal);
           updateWidget(ctx);
           ctx.ui.notify("Goal paused after interruption. Use /goal resume to continue.", "info");
@@ -938,6 +959,7 @@ export default function piGoal(pi: ExtensionAPI) {
         goal.status = "paused";
         goal.stopReason = "interrupted by the user";
         touch(goal);
+        syncActiveTools();
         persistPatch(pi, goal);
         updateWidget(ctx);
         ctx.ui.notify("Goal paused after interruption. Use /goal resume to continue.", "info");
@@ -1015,7 +1037,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
-    description: "Create a persistent, session-scoped goal. The loop continues across turns until completion, pause, block, or a budget/turn limit.",
+    description: "Create a persistent, session-scoped goal. The loop continues across turns until completion, pause, block, or a budget/turn limit. This tool remains available when the user explicitly requests a persistent goal; other pi-goal tools activate only while a goal is active.",
     promptSnippet: "Create a persistent goal to pursue autonomously",
     promptGuidelines: [
       "Call create_goal only when the user explicitly requests a persistent goal.",
@@ -1094,6 +1116,7 @@ export default function piGoal(pi: ExtensionAPI) {
           goal.status = "complete";
           goal.stopReason = "completion condition achieved";
           touch(goal, false);
+          syncActiveTools();
           persistPatch(pi, goal);
           updateWidget(ctx);
           return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}\nUsage: ${formatUsage(goal)}` }], details: { goal: goalDetails(goal) } };
@@ -1106,6 +1129,7 @@ export default function piGoal(pi: ExtensionAPI) {
         goal.blocker = truncate(blocker);
         goal.stopReason = "requires user input or an external dependency";
         touch(goal);
+        syncActiveTools();
         persistPatch(pi, goal);
         updateWidget(ctx);
         return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${goal.blocker}` }], details: { goal: goalDetails(goal) } };
@@ -1242,6 +1266,8 @@ export default function piGoal(pi: ExtensionAPI) {
     renderResult: renderText,
   });
 
+  syncActiveTools();
+
   // -------------------------------------------------------------------------
   // /goal command
   // -------------------------------------------------------------------------
@@ -1308,6 +1334,7 @@ export default function piGoal(pi: ExtensionAPI) {
             rt.goal!.status = "paused";
             rt.goal!.stopReason = "paused by user";
             touch(rt.goal!);
+            syncActiveTools();
             persistPatch(pi, rt.goal!);
             updateWidget(ctx);
           });
@@ -1327,6 +1354,7 @@ export default function piGoal(pi: ExtensionAPI) {
             touch(rt.goal, false);
             persistPatch(pi, rt.goal);
             rt.goal = null;
+            syncActiveTools();
             updateWidget(ctx);
           });
           ctx.ui.notify("Goal cleared.", "info");
@@ -1355,6 +1383,7 @@ export default function piGoal(pi: ExtensionAPI) {
             goal.stopReason = undefined;
             goal.blocker = undefined;
             touch(goal);
+            syncActiveTools();
             persistPatch(pi, goal);
             updateWidget(ctx);
             scheduleResume(ctx);
