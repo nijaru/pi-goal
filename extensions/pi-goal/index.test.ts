@@ -94,16 +94,19 @@ describe("pi-goal extension", () => {
     expect([...pi.tools.keys()]).toEqual(expect.arrayContaining([
       "create_goal", "get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea",
     ]));
-    expect(pi.activeTools).toContain("create_goal");
-    for (const toolName of ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"]) {
-      expect(pi.activeTools).not.toContain(toolName);
-    }
+    expect(pi.getActiveTools).not.toHaveBeenCalled();
+    expect(pi.setActiveTools).not.toHaveBeenCalled();
     expect(pi.getTool("create_goal").description).toContain("explicitly requests");
     expect(pi.getTool("update_goal").description).toContain("user-command-only");
     for (const toolName of ["create_goal", "update_goal", "evaluate_goal", "log_iteration"]) {
       expect(pi.getTool(toolName).promptGuidelines.every((guideline: string) => guideline.includes(toolName))).toBe(true);
     }
     const ctx = createMockCtx(pi.entries);
+    pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    expect(pi.activeTools).toContain("create_goal");
+    for (const toolName of ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"]) {
+      expect(pi.activeTools).not.toContain(toolName);
+    }
     await expect(pi.getTool("log_iteration").execute("0", { hypothesis: "x", result: "x", status: "kept" }, undefined, undefined, ctx)).rejects.toThrow("No active goal");
     await pi.getTool("create_goal").execute("1", { objective: "x", budget: 5 }, undefined, undefined, ctx);
     for (const toolName of ["create_goal", "get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"]) {

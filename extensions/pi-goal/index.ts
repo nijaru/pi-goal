@@ -1266,7 +1266,8 @@ export default function piGoal(pi: ExtensionAPI) {
     renderResult: renderText,
   });
 
-  syncActiveTools();
+  // Active-tool actions are unavailable while the extension factory loads.
+  // session_start reconstructs the goal and applies the initial tool set.
 
   // -------------------------------------------------------------------------
   // /goal command
