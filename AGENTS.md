@@ -19,7 +19,7 @@ Persistent goal loop for pi. Define what "done" means; the agent works until it 
 ## Stack and tests
 
 - TypeScript, Bun
-- Pi extension API (`@earendil-works/pi-coding-agent`)
+- Pi extension API (`@earendil-works/pi-coding-agent`), Pi `>=0.81.0`
 - Pi TUI (`@earendil-works/pi-tui`)
 - Pi AI types (`@earendil-works/pi-ai`)
 
@@ -44,12 +44,12 @@ Statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused` | `c
 
 ## Design rules
 
-- Mutating tools and lifecycle handlers run through one async queue; Pi may execute sibling tool calls concurrently.
-- Bind usage to the goal active at `agent_start`; account one provider response per `turn_end`, persist every turn, check each explicitly configured USD limit after the call, and abort before another turn at an explicitly configured `maxTurns`.
+- Mutating tool operations and usage/accounting updates run through one async queue; lifecycle callbacks fence run ownership before they schedule or account work.
+- Attribute usage to the owning goal generation; account one parent provider response per `turn_end`, persist every turn, check each explicitly configured USD limit after the call, and abort before another turn at an explicitly configured `maxTurns`.
 - A single provider call may overshoot an explicit USD budget. Resuming paused, blocked, or limited goals requires headroom only for a reached limit; command paths share centralized finite/positive/bounds validation.
 - State is validated and bounded during reconstruction. The newest state entry is authoritative, and clear/replacement tombstones prevent stale resurrection.
 - Prompt-injected objective/evidence/notes are bounded, escaped against embedded data-block markers, and clearly marked as untrusted data.
-- Compaction may append a goal snapshot but never substitutes Pi's normal summary or intentionally starts a continuation during compaction. Continuations are queued through Pi's agent lifecycle, allowing Pi's auto-compaction check to finish before follow-ups are drained.
+- Compaction adds a goal snapshot without replacing Pi's normal summary. Automatic continuations use Pi's agent-lifecycle queue, allowing Pi's auto-compaction check to finish before follow-ups are drained.
 - Restored active goals wait for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstruction does not schedule work before a prompt is submitted in the selected branch. Explicit kickoffs and lifecycle continuations use hidden, attributed custom messages queued through Pi's agent lifecycle.
 - Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate recorded evaluations. `evaluate_goal` followed by `update_goal complete` is not itself a mutation. Fresh-context evaluator independence is caller-enforced, not automatic or cryptographic.
 - While a goal is active, block detached/background `workflow` calls from pi-workflows unless `background: false` is explicit; pi-goal does not orchestrate workflows.
