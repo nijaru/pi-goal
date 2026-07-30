@@ -118,14 +118,32 @@ describe("pi-goal extension", () => {
     expect(pi.activeTools).toEqual(new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "create_goal"]));
   });
 
-  test("creates a validated session-persisted goal with bounded defaults", async () => {
+  test("creates a validated session-persisted goal with explicit limits", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx = createMockCtx(pi.entries);
     const result = await pi.getTool("create_goal").execute("1", { objective: "all tests pass", budget: 5 }, undefined, undefined, ctx);
     expect(result.details.goal.status).toBe("active");
-    expect(result.details.goal.maxTurns).toBe(50);
+    expect(result.details.goal.maxTurns).toBeNull();
     expect(pi.appendEntry).toHaveBeenCalledWith("pi-goal/state", expect.objectContaining({ objective: "all tests pass" }));
+  });
+
+  test("defaults both hard limits to unlimited", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    const result = await pi.getTool("create_goal").execute("1", { objective: "run until done" }, undefined, undefined, ctx);
+    expect(result.details.goal.budget).toBeNull();
+    expect(result.details.goal.maxTurns).toBeNull();
+    expect(result.content[0].text).toContain("Budget: unlimited");
+    expect(result.content[0].text).toContain("Max turns: unlimited");
+    const restored = createMockAPI(pi.entries);
+    extension(restored as any);
+    const restoredCtx = createMockCtx(restored.entries);
+    restored.handlers.get("session_start")({ type: "session_start", reason: "startup" }, restoredCtx);
+    const restoredGoal = (await restored.getTool("get_goal").execute("2", {}, undefined, undefined, restoredCtx)).details.goal;
+    expect(restoredGoal.budget).toBeNull();
+    expect(restoredGoal.maxTurns).toBeNull();
   });
 
   test("rejects empty, non-positive, non-finite, and oversized inputs", async () => {
@@ -290,7 +308,9 @@ describe("pi-goal extension", () => {
     pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
     expect(pi.sendMessage).not.toHaveBeenCalled();
     await pi.getCommand("goal").handler("resume", ctx);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
   });
 
   test("tree reconstruction invalidates an achieved evaluation", async () => {
@@ -359,6 +379,37 @@ describe("pi-goal extension", () => {
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
   });
 
+  test("clearing a paused goal does not abort an unrelated user turn", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("paused goal", ctx);
+    await pi.getCommand("goal").handler("pause", ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+    await pi.getCommand("goal").handler("clear", ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+    expect((await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx)).content[0].text).toBe("No active goal.");
+  });
+
+  test("resuming during an unrelated turn defers without aborting it", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("paused goal", ctx);
+    await pi.getCommand("goal").handler("pause", ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+    pi.sendMessage.mockClear();
+    await pi.getCommand("goal").handler("resume", ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    ctx.isIdle.mockReturnValue(true);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+  });
+
   test("/goal starts, pauses, clears, replaces, and resumes only through user commands", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -367,7 +418,9 @@ describe("pi-goal extension", () => {
     const state = await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx);
     expect(state.content[0].text).toContain("Fix the auth bug");
     expect(state.content[0].text).toContain("$0.00 / $2.00");
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
 
     await pi.getCommand("goal").handler("pause", ctx);
     await pi.getCommand("goal").handler("edit --budget=7 second", ctx);
@@ -599,6 +652,11 @@ describe("pi-goal extension", () => {
     await pi.getCommand("goal").handler("resume --budget 2 --max-turns 2", ctx);
     expect(ctx.ui.notify).toHaveBeenLastCalledWith("Goal resumed.", "info");
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+    await pi.getCommand("goal").handler("pause", ctx);
+    await pi.getCommand("goal").handler("resume --budget unlimited --max-turns unlimited", ctx);
+    const unlimited = (await pi.getTool("get_goal").execute("2b", {}, undefined, undefined, ctx)).details.goal;
+    expect(unlimited.budget).toBeNull();
+    expect(unlimited.maxTurns).toBeNull();
   });
 
   test("requires fresh-context evaluation evidence and invalidates it on workspace mutation", async () => {
@@ -692,8 +750,8 @@ describe("pi-goal extension", () => {
     await endTurn(pi, ctx, message, 0);
     await endRun(pi, ctx, [message]);
     await flushTimers();
-    expect(pi.sendMessage).not.toHaveBeenCalled();
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
     await pi.getCommand("goal").handler("clear", ctx);
   });
 

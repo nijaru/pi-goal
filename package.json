@@ -2,7 +2,7 @@
   "name": "pi-goal",
   "version": "0.3.0",
   "type": "module",
-  "description": "Session-scoped, bounded autonomous goals for pi with evidence-gated completion.",
+  "description": "Session-scoped autonomous goals for pi with optional evidence-gated limits and completion.",
   "keywords": [
     "pi-package",
     "pi",

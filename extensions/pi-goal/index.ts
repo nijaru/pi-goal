@@ -28,12 +28,10 @@ import { randomUUID } from "node:crypto";
 const STATE_ENTRY = "pi-goal/state";
 const GOAL_CONTEXT = "pi-goal/context";
 const GOAL_CONTINUATION = "pi-goal/continuation";
-const DEFAULT_BUDGET = 5;
 const MAX_BUDGET = 1_000_000;
 const MAX_MAX_TURNS = 10_000;
 const MAX_REVISION = 1_000_000;
 const MAX_PERSISTED_NUMBER = Number.MAX_SAFE_INTEGER;
-const DEFAULT_MAX_TURNS = 50;
 const MAX_OBJECTIVE = 4_000;
 const MAX_TEXT = 1_000;
 const MAX_EVIDENCE = 2_000;
@@ -74,8 +72,10 @@ interface GoalState {
   sessionId: string;
   objective: string;
   status: GoalStatus;
-  budget: number;
-  maxTurns: number;
+  /** Optional hard USD ceiling; null means unlimited. */
+  budget: number | null;
+  /** Optional hard provider-turn ceiling; null means unlimited. */
+  maxTurns: number | null;
   usage: {
     turns: number;
     inputTokens: number;
@@ -100,8 +100,10 @@ interface GoalPatch {
   id: string;
   sessionId: string;
   status: GoalStatus;
-  budget: number;
-  maxTurns: number;
+  /** Optional hard USD ceiling; null means unlimited. */
+  budget: number | null;
+  /** Optional hard provider-turn ceiling; null means unlimited. */
+  maxTurns: number | null;
   usage: GoalState["usage"];
   revision: number;
   updatedAt: string;
@@ -126,6 +128,7 @@ interface Runtime {
   stopNextAgentStart: boolean;
   userInputQueued: boolean;
   startupPending: boolean;
+  deferredContinuation: { goalId: string; revision: number } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +197,8 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
   if (typeof value.sessionId !== "string" || value.sessionId !== expectedSessionId || value.sessionId.length > MAX_TEXT) return null;
   if (typeof value.objective !== "string" || !value.objective.trim() || value.objective.length > MAX_OBJECTIVE) return null;
   if (!["active", "paused", "blocked", "budget_limited", "complete", "cleared"].includes(String(value.status))) return null;
-  if (!isPositiveNumber(value.budget) || value.budget > MAX_BUDGET) return null;
-  if (!isBoundedInteger(value.maxTurns, MAX_MAX_TURNS)) return null;
+  if (value.budget !== null && (!isPositiveNumber(value.budget) || value.budget > MAX_BUDGET)) return null;
+  if (value.maxTurns !== null && !isBoundedInteger(value.maxTurns, MAX_MAX_TURNS)) return null;
   if (!isRecord(value.usage)) return null;
   const usage = value.usage as { turns?: unknown; inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown; cost?: unknown };
   if (!isNonNegativeInteger(usage.turns) || !isNonNegativeInteger(usage.inputTokens) || !isNonNegativeInteger(usage.outputTokens) || !isNonNegativeInteger(usage.totalTokens) || !isNonNegativeNumber(usage.cost) || usage.cost > MAX_PERSISTED_NUMBER) return null;
@@ -253,11 +256,17 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
   return result;
 }
 
+function isMonotonicLimit(previous: number | null, next: number | null): boolean {
+  // Limits are user-controlled policy. An explicit limit may be raised or
+  // removed, and an unlimited goal may later receive a hard limit.
+  return previous === null || next === null || next >= previous;
+}
+
 function isMonotonicState(previous: GoalState, next: GoalState): boolean {
   if (previous.id !== next.id || previous.sessionId !== next.sessionId) return false;
   if (previous.status === "complete" && next.status !== "complete" && next.status !== "cleared") return false;
   if (next.status !== "cleared" && previous.status === "cleared") return false;
-  if (next.budget < previous.budget || next.maxTurns < previous.maxTurns || next.revision < previous.revision) return false;
+  if (!isMonotonicLimit(previous.budget, next.budget) || !isMonotonicLimit(previous.maxTurns, next.maxTurns) || next.revision < previous.revision) return false;
   const previousUsage = previous.usage;
   const nextUsage = next.usage;
   if (nextUsage.turns < previousUsage.turns || nextUsage.inputTokens < previousUsage.inputTokens || nextUsage.outputTokens < previousUsage.outputTokens || nextUsage.totalTokens < previousUsage.totalTokens || nextUsage.cost < previousUsage.cost) return false;
@@ -285,7 +294,7 @@ function applyPatch(current: GoalState, data: unknown, expectedSessionId: string
   if (data.id !== current.id || data.sessionId !== expectedSessionId) return current;
   const next = clone(current) as GoalState;
   if (!["active", "paused", "blocked", "budget_limited", "complete", "cleared"].includes(String(data.status))) return null;
-  if (!isPositiveNumber(data.budget) || data.budget > MAX_BUDGET || !isBoundedInteger(data.maxTurns, MAX_MAX_TURNS)) return null;
+  if ((data.budget !== null && (!isPositiveNumber(data.budget) || data.budget > MAX_BUDGET)) || (data.maxTurns !== null && !isBoundedInteger(data.maxTurns, MAX_MAX_TURNS))) return null;
   if (!isRecord(data.usage) || !isNonNegativeInteger(data.usage.turns) || !isNonNegativeInteger(data.usage.inputTokens) || !isNonNegativeInteger(data.usage.outputTokens) || !isNonNegativeInteger(data.usage.totalTokens) || !isNonNegativeNumber(data.usage.cost) || data.usage.cost > MAX_PERSISTED_NUMBER) return null;
   if ((!isBoundedInteger(data.revision, MAX_REVISION) && data.revision !== 0) || typeof data.updatedAt !== "string" || data.updatedAt.length > MAX_TEXT) return null;
   if (data.blocker !== null && typeof data.blocker !== "string") return null;
@@ -388,28 +397,38 @@ function requireActive(goal: GoalState | null): asserts goal is GoalState {
   if (goal.status !== "active") throw new Error(`Goal is ${goal.status}.`);
 }
 
-function validateResume(goal: GoalState, requestedBudget?: unknown, requestedMaxTurns?: unknown): { budget: number; maxTurns: number } {
+function validateResume(goal: GoalState, requestedBudget?: unknown, requestedMaxTurns?: unknown): { budget: number | null; maxTurns: number | null } {
   const budget = requestedBudget === undefined ? goal.budget : requestedBudget;
   const maxTurns = requestedMaxTurns === undefined ? goal.maxTurns : requestedMaxTurns;
-  if (!isPositiveNumber(budget) || budget > MAX_BUDGET) {
+  if (budget !== null && (!isPositiveNumber(budget) || budget > MAX_BUDGET)) {
     throw new Error(`Resume budget must be finite, positive, and no greater than ${MAX_BUDGET}.`);
   }
-  if (!isBoundedInteger(maxTurns, MAX_MAX_TURNS)) {
+  if (maxTurns !== null && !isBoundedInteger(maxTurns, MAX_MAX_TURNS)) {
     throw new Error(`Resume maxTurns must be a positive integer no greater than ${MAX_MAX_TURNS}.`);
   }
-  const nextBudget = Math.max(goal.budget, budget);
-  const nextMaxTurns = Math.max(goal.maxTurns, maxTurns);
-  if (nextBudget <= goal.usage.cost) {
+  const nextBudget = goal.budget === null || budget === null ? budget : Math.max(goal.budget, budget);
+  const nextMaxTurns = goal.maxTurns === null || maxTurns === null ? maxTurns : Math.max(goal.maxTurns, maxTurns);
+  if (nextBudget !== null && nextBudget <= goal.usage.cost) {
     throw new Error("Resume requires budget headroom above current usage.");
   }
-  if (nextMaxTurns <= goal.usage.turns) {
+  if (nextMaxTurns !== null && nextMaxTurns <= goal.usage.turns) {
     throw new Error("Resume requires max-turn headroom above current usage.");
   }
   return { budget: nextBudget, maxTurns: nextMaxTurns };
 }
 
+function formatLimit(value: number | null, format: (value: number) => string): string {
+  return value === null ? "unlimited" : format(value);
+}
+
+function displayStatus(status: GoalStatus): string {
+  // Keep the persisted name for compatibility, but do not imply that a turn
+  // limit is a USD budget limit in user-facing status output.
+  return status === "budget_limited" ? "limited" : status;
+}
+
 function formatUsage(goal: GoalState): string {
-  return `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)} · ${goal.usage.totalTokens.toLocaleString()} tokens · ${goal.usage.turns}/${goal.maxTurns} turns`;
+  return `${fmt$(goal.usage.cost)} / ${formatLimit(goal.budget, fmt$)} · ${goal.usage.totalTokens.toLocaleString()} tokens · ${goal.usage.turns}/${formatLimit(goal.maxTurns, value => String(value))} turns`;
 }
 
 function goalDetails(goal: GoalState): Record<string, unknown> {
@@ -586,7 +605,7 @@ function recordProviderUsage(goal: GoalState, usage: ProviderUsage, countTurn = 
 // ---------------------------------------------------------------------------
 
 export default function piGoal(pi: ExtensionAPI) {
-  const rt: Runtime = { goal: null, activeRun: null, stopNextAgentStart: false, userInputQueued: false, startupPending: false };
+  const rt: Runtime = { goal: null, activeRun: null, stopNextAgentStart: false, userInputQueued: false, startupPending: false, deferredContinuation: null };
   let mutationQueue: Promise<unknown> = Promise.resolve();
 
   function mutate<T>(task: () => T | PromiseLike<T>): Promise<T> {
@@ -622,7 +641,7 @@ export default function piGoal(pi: ExtensionAPI) {
         const title = " Goal ";
         return [
           truncateToWidth(theme.fg("borderMuted", "───") + theme.fg("accent", title) + theme.fg("borderMuted", "─".repeat(Math.max(0, w - 4 - visibleWidth(title)))), w),
-          truncateToWidth(`  ${theme.fg(color, `${icon} ${goal.status}`)}  ${theme.fg("muted", `turns: ${goal.usage.turns}/${goal.maxTurns}`)}  ${theme.fg("muted", `cost: ${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`)}`, w),
+          truncateToWidth(`  ${theme.fg(color, `${icon} ${displayStatus(goal.status)}`)}  ${theme.fg("muted", `turns: ${goal.usage.turns}/${formatLimit(goal.maxTurns, value => String(value))}`)}  ${theme.fg("muted", `cost: ${fmt$(goal.usage.cost)} / ${formatLimit(goal.budget, fmt$)}`)}`, w),
           truncateToWidth(`  ${theme.fg("dim", truncate(goal.objective, Math.max(1, w - 4)))}`, w),
         ];
       },
@@ -632,14 +651,14 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function markLimitIfNeeded(goal: GoalState): boolean {
     if (goal.status !== "active") return false;
-    if (goal.usage.cost >= goal.budget) {
+    if (goal.budget !== null && goal.usage.cost >= goal.budget) {
       goal.status = "budget_limited";
       goal.stopReason = "USD budget exhausted";
       touch(goal);
       syncActiveTools();
       return true;
     }
-    if (goal.usage.turns >= goal.maxTurns) {
+    if (goal.maxTurns !== null && goal.usage.turns >= goal.maxTurns) {
       goal.status = "budget_limited";
       goal.stopReason = "turn limit reached";
       touch(goal);
@@ -657,7 +676,12 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.userInputQueued = userWorkQueued;
     rt.stopNextAgentStart = !userWorkQueued;
     if (!userWorkQueued) ctx.abort();
-    ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use /goal resume with higher budget and maxTurns headroom to continue.`, "info");
+    const resumeHint = goal.stopReason === "turn limit reached"
+      ? "/goal resume --max-turns N"
+      : goal.stopReason === "USD budget exhausted"
+        ? "/goal resume --budget N"
+        : "/goal resume with additional headroom";
+    ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use ${resumeHint} to continue.`, "info");
   }
 
   function finalAssistantStopReason(messages: any[]): string | undefined {
@@ -704,11 +728,23 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function startUserContinuation(ctx: ExtensionContext): void {
     if (!rt.goal || rt.goal.status !== "active" || ctx.hasPendingMessages()) return;
-    // Kickoffs from an idle command/session use Pi's normal user-prompt path.
-    // That path performs pre-prompt compaction checks, unlike sendMessage()
-    // with triggerTurn while idle. The short text is supplemented by the
-    // hidden before_agent_start goal context.
-    pi.sendUserMessage("Continue the active goal and make one concrete, evidence-backed step.");
+    const goal = rt.goal;
+    if (!ctx.isIdle()) {
+      // A user command must not interrupt an unrelated turn. Start the goal
+      // only after Pi reports that retries, compaction, and follow-ups settle.
+      rt.deferredContinuation = { goalId: goal.id, revision: goal.revision };
+      return;
+    }
+    rt.deferredContinuation = null;
+    // A goal kickoff is extension control flow, not a user-authored prompt.
+    // Keep it out of the visible transcript. The custom content carries the
+    // bounded objective/state because this is not a normal user prompt.
+    pi.sendMessage({
+      customType: GOAL_CONTINUATION,
+      content: buildContinuationPrompt(goal),
+      display: false,
+      details: { goalId: goal.id, revision: goal.revision },
+    }, { triggerTurn: true, deliverAs: "followUp" });
   }
 
   function scheduleResume(ctx: ExtensionContext): void {
@@ -716,21 +752,25 @@ export default function piGoal(pi: ExtensionAPI) {
   }
 
   async function abortActiveRunForUserCommand(ctx: ExtensionContext & { waitForIdle?: () => Promise<void> }): Promise<void> {
-    if (ctx.isIdle()) return;
+    // Do not stop an unrelated user turn merely because a paused/blocked goal
+    // exists. Only an active run that was bound to this goal belongs to the
+    // lifecycle command being handled.
+    const goal = rt.goal;
+    if (ctx.isIdle() || !goal || goal.status !== "active" || rt.activeRun?.goalId !== goal.id) return;
     ctx.abort();
     if (ctx.waitForIdle) await ctx.waitForIdle();
   }
 
-  function validateCreation(objective: string, budget: number, maxTurns: number): string {
+  function validateCreation(objective: string, budget: number | null, maxTurns: number | null): string {
     const cleanedObjective = typeof objective === "string" ? objective.trim() : "";
     if (!cleanedObjective) throw new Error("Objective is required.");
     if (cleanedObjective.length > MAX_OBJECTIVE) throw new Error(`Objective must be ${MAX_OBJECTIVE} characters or fewer.`);
-    if (!isPositiveNumber(budget) || budget > MAX_BUDGET) throw new Error(`Budget must be finite, positive, and no greater than ${MAX_BUDGET}.`);
-    if (!isBoundedInteger(maxTurns, MAX_MAX_TURNS)) throw new Error(`maxTurns must be a positive integer no greater than ${MAX_MAX_TURNS}.`);
+    if (budget !== null && (!isPositiveNumber(budget) || budget > MAX_BUDGET)) throw new Error(`Budget must be finite, positive, and no greater than ${MAX_BUDGET}.`);
+    if (maxTurns !== null && !isBoundedInteger(maxTurns, MAX_MAX_TURNS)) throw new Error(`maxTurns must be a positive integer no greater than ${MAX_MAX_TURNS}.`);
     return cleanedObjective;
   }
 
-  function createGoal(objective: string, budget: number, maxTurns: number, ctx: ExtensionContext, replace: boolean): GoalState {
+  function createGoal(objective: string, budget: number | null, maxTurns: number | null, ctx: ExtensionContext, replace: boolean): GoalState {
     const cleanedObjective = validateCreation(objective, budget, maxTurns);
 
     if (rt.goal && ["active", "paused", "blocked", "budget_limited"].includes(rt.goal.status)) {
@@ -745,6 +785,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.stopNextAgentStart = false;
     rt.userInputQueued = false;
     rt.startupPending = false;
+    rt.deferredContinuation = null;
     const goal: GoalState = {
       schemaVersion: 1,
       id: randomUUID().replace(/[^a-z0-9-]/gi, "").toLowerCase().slice(0, 12),
@@ -774,6 +815,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.stopNextAgentStart = false;
     rt.userInputQueued = false;
     rt.startupPending = startContinuation;
+    rt.deferredContinuation = null;
     rt.goal = readGoal(ctx);
     if (isolateFork && rt.goal) {
       // Forked sessions inherit conversation entries, including custom state.
@@ -814,6 +856,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.stopNextAgentStart = false;
     rt.userInputQueued = false;
     rt.startupPending = false;
+    rt.deferredContinuation = null;
     rt.goal = null;
     syncActiveTools();
   });
@@ -975,6 +1018,19 @@ export default function piGoal(pi: ExtensionAPI) {
     if (shouldContinue && rt.goal?.status === "active" && (!runGoalId || rt.goal.id === runGoalId)) queueContinuation(ctx);
   });
 
+  pi.on("agent_settled", (_event, ctx) => {
+    const pending = rt.deferredContinuation;
+    if (!pending) return;
+    const goal = rt.goal;
+    if (!goal || goal.status !== "active" || goal.id !== pending.goalId || goal.revision !== pending.revision) {
+      rt.deferredContinuation = null;
+      return;
+    }
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    rt.deferredContinuation = null;
+    startUserContinuation(ctx);
+  });
+
   pi.on("before_provider_request", (_event, ctx) => {
     // turn_end calls abort(), but the core loop may reach its next provider
     // boundary before it observes the signal. Abort again at the last safe
@@ -1037,29 +1093,28 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
-    description: "Create a persistent, session-scoped goal. The loop continues across turns until completion, pause, block, or a budget/turn limit. This tool remains available when the user explicitly requests a persistent goal; other pi-goal tools activate only while a goal is active.",
+    description: "Create a persistent, session-scoped goal. By default the loop continues until completion, pause, or block; optional USD and turn limits provide hard bounds. This tool remains available when the user explicitly requests a persistent goal; other pi-goal tools activate only while a goal is active.",
     promptSnippet: "Create a persistent goal to pursue autonomously",
     promptGuidelines: [
       "Call create_goal only when the user explicitly requests a persistent goal.",
       "Use create_goal with one concrete, verifiable objective and a clear stopping condition.",
-      "Set create_goal budget as an authoritative USD ceiling based on provider-reported usage; maxTurns is a hard safety limit.",
+      "Call create_goal with budget or maxTurns only when the user requests a hard bound; omitted limits are unlimited.",
     ],
     parameters: Type.Object({
       objective: Type.String({ description: "Concrete objective to pursue (maximum 4000 characters)." }),
-      budget: Type.Number({ description: "Maximum USD spend for the goal." }),
-      maxTurns: Type.Optional(Type.Number({ description: "Maximum agent turns for the goal (default 50)." })),
+      budget: Type.Optional(Type.Number({ description: "Optional maximum USD spend; omit for unlimited." })),
+      maxTurns: Type.Optional(Type.Number({ description: "Optional maximum provider turns; omit for unlimited." })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       return mutate(() => {
-        const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;
-        const goal = createGoal(params.objective, params.budget, maxTurns, ctx, false);
+        const goal = createGoal(params.objective, params.budget ?? null, params.maxTurns ?? null, ctx, false);
         return {
-          content: [{ type: "text" as const, text: `Goal created\nObjective: ${goal.objective}\nBudget: ${fmt$(goal.budget)}\nMax turns: ${goal.maxTurns}\n\nThe goal is session-scoped. Start or resume its loop with a user command or a subsequent session prompt.` }],
+          content: [{ type: "text" as const, text: `Goal created\nObjective: ${goal.objective}\nBudget: ${formatLimit(goal.budget, fmt$)}\nMax turns: ${formatLimit(goal.maxTurns, value => String(value))}\n\nThe goal is session-scoped. Start or resume its loop with a user command or a subsequent session prompt.` }],
           details: { goal: goalDetails(goal) },
         };
       });
     },
-    renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 50)) + theme.fg("dim", ` (${fmt$(args.budget)})`), 0, 0); },
+    renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 50)) + theme.fg("dim", args.budget === undefined ? " (unlimited)" : ` (${fmt$(args.budget)})`), 0, 0); },
     renderResult: renderText,
   });
 
@@ -1075,7 +1130,7 @@ export default function piGoal(pi: ExtensionAPI) {
       return {
         content: [{ type: "text" as const, text: [
           `Objective: ${goal.objective}`,
-          `Status: ${goal.status}`,
+          `Status: ${displayStatus(goal.status)}`,
           `Usage: ${formatUsage(goal)}`,
           `Elapsed: ${elapsed(goal)}`,
           `Iterations: ${goal.iterations.length}`,
@@ -1115,6 +1170,7 @@ export default function piGoal(pi: ExtensionAPI) {
           }
           goal.status = "complete";
           goal.stopReason = "completion condition achieved";
+          rt.deferredContinuation = null;
           touch(goal, false);
           syncActiveTools();
           persistPatch(pi, goal);
@@ -1127,6 +1183,7 @@ export default function piGoal(pi: ExtensionAPI) {
         if (!blocker) throw new Error("blocker description required when status is blocked");
         goal.status = "blocked";
         goal.blocker = truncate(blocker);
+        rt.deferredContinuation = null;
         goal.stopReason = "requires user input or an external dependency";
         touch(goal);
         syncActiveTools();
@@ -1273,7 +1330,11 @@ export default function piGoal(pi: ExtensionAPI) {
   // /goal command
   // -------------------------------------------------------------------------
 
-  function parseOptions(input: string, defaults: { budget: number; maxTurns: number }): { objective: string; budget: number; maxTurns: number } {
+  function parseLimit(raw: string): number | null {
+    return /^(?:unlimited|none|off)$/i.test(raw) ? null : Number(raw);
+  }
+
+  function parseOptions(input: string, defaults: { budget: number | null; maxTurns: number | null }): { objective: string; budget: number | null; maxTurns: number | null } {
     const tokens = input.trim().split(/\s+/).filter(Boolean);
     const remaining: string[] = [];
     let budget = defaults.budget;
@@ -1285,11 +1346,11 @@ export default function piGoal(pi: ExtensionAPI) {
       if (match) {
         const raw = match[1] ?? tokens[++i];
         if (!raw) throw new Error("--budget requires a value");
-        budget = Number(raw);
+        budget = parseLimit(raw);
       } else if (turnsMatch) {
         const raw = turnsMatch[1] ?? tokens[++i];
         if (!raw) throw new Error("--max-turns requires a value");
-        maxTurns = Number(raw);
+        maxTurns = parseLimit(raw);
       } else {
         remaining.push(token);
       }
@@ -1301,7 +1362,7 @@ export default function piGoal(pi: ExtensionAPI) {
     const goal = rt.goal;
     if (!goal) return "No active goal.";
     return [
-      `🎯 [${goal.status}] ${goal.objective}`,
+      `🎯 [${displayStatus(goal.status)}] ${goal.objective}`,
       `Usage: ${formatUsage(goal)} | elapsed: ${elapsed(goal)}`,
       `Iterations: ${goal.iterations.length} | revision: ${goal.revision}`,
       goal.stopReason ? `Stop reason: ${goal.stopReason}` : "",
@@ -1334,6 +1395,7 @@ export default function piGoal(pi: ExtensionAPI) {
             requireActive(rt.goal);
             rt.goal!.status = "paused";
             rt.goal!.stopReason = "paused by user";
+            rt.deferredContinuation = null;
             touch(rt.goal!);
             syncActiveTools();
             persistPatch(pi, rt.goal!);
@@ -1352,6 +1414,7 @@ export default function piGoal(pi: ExtensionAPI) {
             if (!rt.goal) return;
             rt.goal.status = "cleared";
             rt.goal.stopReason = "cleared by user";
+            rt.deferredContinuation = null;
             touch(rt.goal, false);
             persistPatch(pi, rt.goal);
             rt.goal = null;
@@ -1362,7 +1425,7 @@ export default function piGoal(pi: ExtensionAPI) {
           return;
         }
         if (command === "resume") {
-          const spec = parseOptions(raw.slice(command.length), { budget: rt.goal?.budget ?? DEFAULT_BUDGET, maxTurns: rt.goal?.maxTurns ?? DEFAULT_MAX_TURNS });
+          const spec = parseOptions(raw.slice(command.length), { budget: rt.goal?.budget ?? null, maxTurns: rt.goal?.maxTurns ?? null });
           requireGoal(rt.goal);
           const initialGoal = rt.goal!;
           const recoveringStartup = initialGoal.status === "active" && rt.startupPending;
@@ -1378,6 +1441,7 @@ export default function piGoal(pi: ExtensionAPI) {
             const limits = validateResume(goal, spec.budget, spec.maxTurns);
             rt.stopNextAgentStart = false;
             rt.startupPending = false;
+            rt.deferredContinuation = null;
             goal.budget = limits.budget;
             goal.maxTurns = limits.maxTurns;
             goal.status = "active";
@@ -1394,11 +1458,11 @@ export default function piGoal(pi: ExtensionAPI) {
         }
 
         const objectiveInput = command === "edit" ? raw.slice(command.length).trim() : raw;
-        const spec = parseOptions(objectiveInput, { budget: DEFAULT_BUDGET, maxTurns: DEFAULT_MAX_TURNS });
+        const spec = parseOptions(objectiveInput, { budget: null, maxTurns: null });
         validateCreation(spec.objective, spec.budget, spec.maxTurns);
         await abortActiveRunForUserCommand(ctx);
         const goal = await mutate(() => createGoal(spec.objective, spec.budget, spec.maxTurns, ctx, true));
-        ctx.ui.notify(`Goal started: ${goal.objective}\nBudget: ${fmt$(goal.budget)} · max turns: ${goal.maxTurns}`, "info");
+        ctx.ui.notify(`Goal started: ${goal.objective}\nBudget: ${formatLimit(goal.budget, fmt$)} · max turns: ${formatLimit(goal.maxTurns, value => String(value))}`, "info");
         scheduleResume(ctx);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

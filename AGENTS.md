@@ -1,6 +1,6 @@
 # pi-goal
 
-Persistent, bounded loop for pi. Define what "done" means; the agent works until it is complete, paused, blocked, or bounded.
+Persistent goal loop for pi. Define what "done" means; the agent works until it is complete, paused, blocked, or an explicitly configured limit is reached.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ Persistent, bounded loop for pi. Define what "done" means; the agent works until
 
 ## Scope
 
-- No unbounded loops: every goal has USD and max-turn limits
+- Goals default to unlimited USD and turns; explicit user-provided limits remain hard bounds
 - No orchestration: that belongs to pi-workflows
 - No agent definitions: that belongs to pi-subagents
 - No destructive Git automation or arbitrary model-supplied shell hooks
@@ -33,7 +33,7 @@ git diff --check
 
 | Tool | Key params | Notes |
 |------|-----------|-------|
-| `create_goal` | `objective`, `budget`, `maxTurns?` | Fails if a nonterminal goal exists |
+| `create_goal` | `objective`, optional `budget`, optional `maxTurns` | Omitted limits are unlimited; fails if a nonterminal goal exists |
 | `get_goal` | (none) | Read-only state and usage |
 | `update_goal` | `status: complete\|blocked`, `blocker?` | Completion requires current-revision evaluation with evidence |
 | `evaluate_goal` | `verdict?`, `reason?`, `evidence?` | Caller supplies fresh context; achieved requires non-empty evidence |
@@ -45,12 +45,12 @@ Statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused` | `c
 ## Design rules
 
 - Mutating tools and lifecycle handlers run through one async queue; Pi may execute sibling tool calls concurrently.
-- Bind usage to the goal active at `agent_start`; account one provider response per `turn_end`, persist every turn, check USD after the call, and abort before another turn at `maxTurns`.
-- A single provider call may overshoot the USD budget. Resuming paused, blocked, or limited goals requires both budget and max-turn headroom; command paths share centralized finite/positive/bounds validation.
+- Bind usage to the goal active at `agent_start`; account one provider response per `turn_end`, persist every turn, check each explicitly configured USD limit after the call, and abort before another turn at an explicitly configured `maxTurns`.
+- A single provider call may overshoot an explicit USD budget. Resuming paused, blocked, or limited goals requires headroom only for a reached limit; command paths share centralized finite/positive/bounds validation.
 - State is validated and bounded during reconstruction. The newest state entry is authoritative, and clear/replacement tombstones prevent stale resurrection.
 - Prompt-injected objective/evidence/notes are bounded, escaped against embedded data-block markers, and clearly marked as untrusted data.
 - Compaction may append a goal snapshot but never substitutes Pi's normal summary or intentionally starts a continuation during compaction. Continuations are queued through Pi's agent lifecycle, allowing Pi's auto-compaction check to finish before follow-ups are drained.
-- Restored active goals wait for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstruction does not schedule work before a prompt is submitted in the selected branch. Normal goal turns use queued agent-lifecycle follow-ups.
+- Restored active goals wait for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstruction does not schedule work before a prompt is submitted in the selected branch. Goal kickoffs use hidden extension messages rather than synthetic visible user prompts; normal goal turns use queued agent-lifecycle follow-ups.
 - Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate recorded evaluations. `evaluate_goal` followed by `update_goal complete` is not itself a mutation. Fresh-context evaluator independence is caller-enforced, not automatic or cryptographic.
 - While a goal is active, block detached/background `workflow` calls from pi-workflows unless `background: false` is explicit; pi-goal does not orchestrate workflows.
 - Completion is gated by an `achieved` evaluation whose revision matches the goal revision and whose evidence is non-empty. The caller supplies a genuinely fresh, read-only evaluator (the pending `subagent` handoff is supported); the extension does not invoke or cryptographically attest a second model.
