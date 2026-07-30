@@ -61,7 +61,9 @@ const providerUsage = (cost: number, input = 2, output = 3, totalTokens = 5) => 
 });
 
 async function startRun(pi: any, ctx: any): Promise<void> {
+  pi.handlers.get("input")({ type: "input", text: "test prompt", source: "interactive" }, ctx);
   pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+  pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "test prompt" }] } }, ctx);
   await Promise.resolve();
 }
 
@@ -71,6 +73,14 @@ async function endTurn(pi: any, ctx: any, message: any, turnIndex: number): Prom
 
 async function endRun(pi: any, ctx: any, messages: any[]): Promise<void> {
   await pi.handlers.get("agent_end")({ type: "agent_end", messages }, ctx);
+}
+
+async function settleKickoff(pi: any, ctx: any): Promise<void> {
+  const kickoff = pi.sendMessage.mock.calls.at(-1)?.[0];
+  pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+  pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...kickoff } }, ctx);
+  await endRun(pi, ctx, [assistant(0)]);
+  pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
 }
 
 async function flushTimers(): Promise<void> {
@@ -308,9 +318,10 @@ describe("pi-goal extension", () => {
     pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
     expect(pi.sendMessage).not.toHaveBeenCalled();
     await pi.getCommand("goal").handler("resume", ctx);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendMessage.mock.calls[0]?.[0].content).toContain("tree goal");
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   test("tree reconstruction invalidates an achieved evaluation", async () => {
@@ -397,6 +408,7 @@ describe("pi-goal extension", () => {
     extension(pi as any);
     const ctx: any = createMockCtx(pi.entries);
     await pi.getCommand("goal").handler("paused goal", ctx);
+    await settleKickoff(pi, ctx);
     await pi.getCommand("goal").handler("pause", ctx);
     await startRun(pi, ctx);
     ctx.isIdle.mockReturnValue(false);
@@ -408,6 +420,122 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("pending messages do not lose a deferred kickoff", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("paused goal", ctx);
+    await settleKickoff(pi, ctx);
+    await pi.getCommand("goal").handler("pause", ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+    ctx.hasPendingMessages.mockReturnValue(true);
+    await pi.getCommand("goal").handler("resume", ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+    ctx.isIdle.mockReturnValue(true);
+    ctx.hasPendingMessages.mockReturnValue(false);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("resuming a limited goal waits for its old run to settle", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "limited", budget: 5, maxTurns: 1 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0);
+    await endTurn(pi, ctx, message, 0);
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("budget_limited");
+    ctx.isIdle.mockReturnValue(false);
+    ctx.waitForIdle = async () => {
+      ctx.isIdle.mockReturnValue(true);
+      await endRun(pi, ctx, [{ ...message, stopReason: "aborted" }]);
+    };
+    await pi.getCommand("goal").handler("resume --max-turns 2", ctx);
+    expect((await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+  });
+
+  test("stale automatic continuations are fenced after clear", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "stale continuation", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, message, 0);
+    await endRun(pi, ctx, [message]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+    expect(queued).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    await pi.getCommand("goal").handler("clear", ctx);
+    const context = pi.handlers.get("context")({ type: "context", messages: [
+      { role: "custom", customType: "pi-goal/continuation", ...queued },
+    ] }, ctx);
+    expect(context.messages).toHaveLength(0);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    expect(ctx.abort).toHaveBeenCalled();
+  });
+
+  test("kickoff replacements retain identity fences without user-message races", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("first kickoff", ctx);
+    const first = pi.sendMessage.mock.calls[0]?.[0];
+    await pi.getCommand("goal").handler("pause", ctx);
+    await pi.getCommand("goal").handler("resume", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...first } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    await endRun(pi, ctx, [{ ...assistant(0), stopReason: "aborted" }]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("kickoffs are hidden custom messages and are fenced before the provider", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("hidden kickoff", ctx);
+    const kickoff = pi.sendMessage.mock.calls[0]?.[0];
+    expect(kickoff).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    await pi.getCommand("goal").handler("pause", ctx);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...kickoff } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalled();
+  });
+
+  test("automatic continuations and retries retain goal ownership", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "continue", budget: 5, maxTurns: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    // Pi emits agent_start before message_start for a queued follow-up.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", customType: "other-extension", content: "other follow-up" } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    const failed = { ...assistant(0.1, 10, 5, 15), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    const state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.usage.turns).toBe(3);
   });
 
   test("/goal starts, pauses, clears, replaces, and resumes only through user commands", async () => {
@@ -418,9 +546,9 @@ describe("pi-goal extension", () => {
     const state = await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx);
     expect(state.content[0].text).toContain("Fix the auth bug");
     expect(state.content[0].text).toContain("$0.00 / $2.00");
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
 
     await pi.getCommand("goal").handler("pause", ctx);
     await pi.getCommand("goal").handler("edit --budget=7 second", ctx);
@@ -429,6 +557,28 @@ describe("pi-goal extension", () => {
     expect(replaced.content[0].text).toContain("$0.00 / $7.00");
     await pi.getCommand("goal").handler("clear", ctx);
     expect((await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx)).content[0].text).toBe("No active goal.");
+  });
+
+  test("post-run compaction stays with the replaced goal", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("old goal", ctx);
+    const prompt = pi.sendMessage.mock.calls[0]?.[0];
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...prompt } }, ctx);
+    await endRun(pi, ctx, [assistant(0)]);
+    await pi.getCommand("goal").handler("edit new goal", ctx);
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(0.5) },
+      fromExtension: false,
+      reason: "threshold",
+      willRetry: false,
+    }, ctx);
+    const state = (await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.objective).toBe("new goal");
+    expect(state.usage.cost).toBe(0);
   });
 
   test("accounts provider usage once per turn from agent_start through turn_end", async () => {
@@ -575,6 +725,22 @@ describe("pi-goal extension", () => {
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
   });
 
+  test("tool-created goals continue after an automatic retry", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await startRun(pi, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "retry-created", budget: 5 }, undefined, undefined, ctx);
+    const failed = { ...assistant(0, 10, 5, 15), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    const retried = assistant(0);
+    await endTurn(pi, ctx, retried, 0);
+    await endRun(pi, ctx, [retried]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("charges a cleared-at-runtime goal only on its tombstone", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -612,6 +778,8 @@ describe("pi-goal extension", () => {
     ctx.hasPendingMessages.mockReturnValue(true);
     const message = assistant(0);
     await endTurn(pi, ctx, message, 0);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "queued RPC work" }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
     await endRun(pi, ctx, [message]);
     expect(ctx.abort).not.toHaveBeenCalled();
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("budget_limited");
@@ -839,14 +1007,16 @@ describe("pi-goal extension", () => {
     const ctx = createMockCtx(pi.entries);
     await pi.getTool("create_goal").execute("1", { objective: "new", budget: 5 }, undefined, undefined, ctx);
     const currentId = pi.entries.at(-1).data.id;
+    const currentDetails = pi.handlers.get("before_agent_start")({ type: "before_agent_start", prompt: "x" }, ctx).message.details;
     const result = pi.handlers.get("context")({ messages: [
-      { role: "custom", customType: "pi-goal/context", details: { goalId: "wrong" } },
-      { role: "custom", customType: "pi-goal/context", details: { goalId: currentId } },
-      { role: "custom", customType: "pi-goal/continuation", details: { goalId: currentId } },
-      { role: "custom", customType: "pi-goal/context", details: { goalId: currentId } },
+      { role: "custom", customType: "pi-goal/context", details: { goalId: "wrong", activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
+      { role: "custom", customType: "pi-goal/context", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
+      { role: "custom", customType: "pi-goal/continuation", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
+      { role: "custom", customType: "pi-goal/context", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
       { role: "user", content: "keep me" },
+      { role: "user", content: "Please explain [pi-goal automatic kickoff quoted-example] Continue the active goal and make one concrete, evidence-backed step." },
     ] }, ctx);
-    expect(result.messages).toHaveLength(3);
+    expect(result.messages).toHaveLength(4);
     expect(result.messages[0].customType).toBe("pi-goal/continuation");
     expect(result.messages[1].customType).toBe("pi-goal/context");
   });

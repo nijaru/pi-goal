@@ -10,6 +10,8 @@ State lives in Pi session custom entries, so resume and `/tree` are branch-aware
 pi install git:github.com/nijaru/pi-goal
 ```
 
+Requires Pi `>=0.81.0` for lifecycle-settlement and usage accounting events.
+
 ## Quick Start
 
 ```text
@@ -68,6 +70,6 @@ any goal state → cleared (/goal clear or replacement)
 
 ## Persistence
 
-The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs are hidden extension messages, not synthetic visible user prompts.
+The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs and follow-ups are hidden, attributed custom messages; they never fabricate a visible user prompt.
 
 MIT

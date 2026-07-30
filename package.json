@@ -31,9 +31,9 @@
     "test": "bun test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.79.9 <0.83.0",
-    "@earendil-works/pi-coding-agent": ">=0.79.9 <0.83.0",
-    "@earendil-works/pi-tui": ">=0.79.9 <0.83.0"
+    "@earendil-works/pi-ai": ">=0.81.0 <0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.81.0 <0.83.0",
+    "@earendil-works/pi-tui": ">=0.81.0 <0.83.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.82.1",
