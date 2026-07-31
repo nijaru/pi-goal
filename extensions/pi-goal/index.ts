@@ -680,6 +680,10 @@ export default function piGoal(pi: ExtensionAPI) {
     if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.createdGoalId !== undefined || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
     rt.kickoff = null;
     rt.pendingContinuation = null;
+    // Dispatch identities belong to the fenced activation. Stale delivered
+    // messages are still rejected by their embedded generation token, so the
+    // map can be cleared here without losing the fence.
+    rt.automaticDispatches.clear();
     rt.automaticRun = null;
     rt.staleAutomaticRun = false;
     if (rt.retryOwner || rt.retryCreatedGoal) rt.staleRetry = true;
@@ -1371,9 +1375,10 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.settlementOwner = null;
     const kickoff = rt.kickoff;
     if (!kickoff) {
-      // A dispatch that never reached message_start cannot be delivered after
-      // settlement; clear it so a later command can request a fresh kickoff.
-      rt.automaticDispatches.clear();
+      // Keep a dispatch registered until message_start consumes it. A
+      // continuation queued by agent_end may be delivered just after the
+      // settlement callback; clearing it here loses goal ownership and can
+      // turn the next provider request into an unowned or aborted run.
       rt.retryOwner = null;
       rt.retryCreatedGoal = null;
       drainPendingContinuation(ctx);

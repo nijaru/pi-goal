@@ -761,6 +761,27 @@ describe("pi-goal extension", () => {
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.usage.turns).toBe(0);
   });
 
+  test("retains continuation ownership when settlement precedes delivery", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "settlement ordering", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.usage.turns).toBe(2);
+    expect(state.usage.cost).toBeCloseTo(0.1);
+  });
+
   test("does not drop a model-created continuation when another message is pending", async () => {
     const pi = createMockAPI();
     extension(pi as any);
