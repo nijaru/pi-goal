@@ -359,7 +359,7 @@ describe("pi-goal extension", () => {
     await expect(update.execute("4", { status: "complete" }, undefined, undefined, ctx)).rejects.toThrow("Completion requires");
   });
 
-  test("reload aborts a goal-owned run before replacing runtime ownership", async () => {
+  test("reload fences a goal-owned run before replacing runtime ownership", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx: any = createMockCtx(pi.entries);
@@ -370,9 +370,18 @@ describe("pi-goal extension", () => {
     pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
 
-    pi.handlers.get("session_start")({ type: "session_start", reason: "reload" }, ctx);
-    await endTurn(pi, ctx, { ...assistant(0), stopReason: "aborted" }, 0);
-    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    const replacement = createMockAPI(pi.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries);
+    replacementCtx.isIdle.mockReturnValue(false);
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(1);
+
+    // A tail event from the abandoned runtime cannot charge the replacement.
+    await replacement.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(1), toolResults: [] }, replacementCtx);
+    const state = (await replacement.getTool("get_goal").execute("2", {}, undefined, undefined, replacementCtx)).details.goal;
     expect(state.status).toBe("active");
     expect(state.usage.turns).toBe(0);
   });
@@ -386,6 +395,119 @@ describe("pi-goal extension", () => {
 
     pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
+  test("reload fences a retry that survives the TUI abort path", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "retry reload", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    ctx.isIdle.mockReturnValue(false);
+
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+    const replacement = createMockAPI(pi.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries);
+    replacementCtx.isIdle.mockReturnValue(false);
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+
+    // The retry wakes without a dispatch identity in the replacement runtime.
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(1);
+    const state = (await replacement.getTool("get_goal").execute("2", {}, undefined, undefined, replacementCtx)).details.goal;
+    expect(state.usage.turns).toBe(1);
+    expect(state.status).toBe("active");
+  });
+
+  test("reload fences survive activation changes and allow a new current continuation", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "reload continuation", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    ctx.isIdle.mockReturnValue(false);
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+
+    const replacement = createMockAPI(pi.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries);
+    replacementCtx.isIdle.mockReturnValue(false);
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(0);
+
+    // A real user turn after reload may change activation and queue a fresh
+    // continuation. The old fence must remain until that fresh dispatch is
+    // identified, rather than aborting valid same-goal work.
+    await startRun(replacement, replacementCtx);
+    const userMessage = assistant(0.1, 10, 5, 15, true);
+    await endTurn(replacement, replacementCtx, userMessage, 0);
+    await endRun(replacement, replacementCtx, [userMessage]);
+    const queued = replacement.sendMessage.mock.calls.at(-1)?.[0];
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(0);
+  });
+
+  test("clear preserves a retry fence across reload", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "clear retry reload", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    ctx.isIdle.mockReturnValue(false);
+    await pi.getCommand("goal").handler("clear", ctx);
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).content[0].text).toBe("No active goal.");
+
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+    const replacement = createMockAPI(pi.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries);
+    replacementCtx.isIdle.mockReturnValue(false);
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+    // Input can be queued before the old retry reaches its provider boundary;
+    // it must not be mistaken for a delivered user-owned run.
+    replacement.handlers.get("input")({ type: "input", text: "user queued", source: "interactive" }, replacementCtx);
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("replacement goals do not discard an older retry fence", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "old retry", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    ctx.isIdle.mockReturnValue(false);
+    await pi.getCommand("goal").handler("edit replacement goal", ctx);
+
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+    const replacement = createMockAPI(pi.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries);
+    replacementCtx.isIdle.mockReturnValue(false);
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).toHaveBeenCalledTimes(1);
+    const state = (await replacement.getTool("get_goal").execute("2", {}, undefined, undefined, replacementCtx)).details.goal;
+    expect(state.objective).toBe("replacement goal");
+    expect(state.usage.turns).toBe(0);
   });
 
   test("compaction snapshots state without replacing Pi's normal summary or starting work", async () => {
@@ -495,6 +617,29 @@ describe("pi-goal extension", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  test("lifecycle commands do not wait through retry backoff", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "retry pause", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    ctx.isIdle.mockReturnValue(false);
+    ctx.waitForIdle = mock(async () => {});
+
+    await pi.getCommand("goal").handler("pause", ctx);
+    expect(ctx.waitForIdle).not.toHaveBeenCalled();
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
+
+    // When the uncancelled retry wakes, the stale retry fence aborts it before
+    // any provider call can run as unowned work.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(2);
+  });
+
   test("resuming a limited goal waits for its old run to settle", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -549,6 +694,28 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("legacy continuations are filtered and fenced at the provider boundary", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "legacy continuation", budget: 5 }, undefined, undefined, ctx);
+    const goalId = pi.entries.at(-1).data.id;
+    const legacy = {
+      role: "custom",
+      customType: "pi-goal/continuation",
+      content: "legacy continuation",
+      details: { goalId, revision: 0 },
+    };
+    const filtered = pi.handlers.get("context")({ type: "context", messages: [legacy] }, ctx);
+    expect(filtered.messages).toHaveLength(0);
+    expect(ctx.abort).not.toHaveBeenCalled();
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: legacy }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
   });
 
   test("kickoffs are hidden custom messages and are fenced before the provider", async () => {
@@ -1207,7 +1374,7 @@ describe("pi-goal extension", () => {
     const result = pi.handlers.get("context")({ messages: [
       { role: "custom", customType: "pi-goal/context", details: { goalId: "wrong", activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
       { role: "custom", customType: "pi-goal/context", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
-      { role: "custom", customType: "pi-goal/continuation", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
+      { role: "custom", customType: "pi-goal/continuation", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch, dispatchId: "current-dispatch" } },
       { role: "custom", customType: "pi-goal/context", details: { goalId: currentId, activationId: currentDetails.activationId, activationEpoch: currentDetails.activationEpoch } },
       { role: "user", content: "keep me" },
       { role: "user", content: "Please explain [pi-goal automatic kickoff quoted-example] Continue the active goal and make one concrete, evidence-backed step." },

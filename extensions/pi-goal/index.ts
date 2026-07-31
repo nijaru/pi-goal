@@ -94,6 +94,12 @@ interface GoalState {
   lastEvaluation?: GoalEvaluation;
 }
 
+interface ReloadFence {
+  token: string;
+  /** null means the abandoned synthetic run had no reconstructable goal ID. */
+  goalId: string | null;
+}
+
 interface GoalPatch {
   schemaVersion: 1;
   kind: "patch";
@@ -139,6 +145,7 @@ interface ActiveRun {
   createdGoalId?: string;
   createdGoalEpoch?: number;
   createdGoalRetry: boolean;
+  retryRun: boolean;
   turnsSeen: Set<number>;
   hadToolActivity: boolean;
 }
@@ -162,6 +169,7 @@ interface Runtime {
   retryCreatedGoal: { goalId: string; goalGeneration: number; activationEpoch: number } | null;
   staleRetry: boolean;
   settlementOwner: { goalId: string | null; goalGeneration: number; activationEpoch: number; goal?: GoalState } | null;
+  reloadFence: ReloadFence | null;
   nextDispatchId: number;
 }
 
@@ -308,6 +316,13 @@ function isMonotonicState(previous: GoalState, next: GoalState): boolean {
   return true;
 }
 
+function validReloadFence(value: unknown): value is ReloadFence {
+  return isRecord(value)
+    && typeof value.token === "string"
+    && /^[a-z0-9-]{8,64}$/.test(value.token)
+    && (value.goalId === null || typeof value.goalId === "string");
+}
+
 function scalarPatch(goal: GoalState): Omit<GoalPatch, "schemaVersion" | "kind" | "id" | "sessionId" | "appendIterations" | "appendIdeas"> {
   return {
     status: goal.status,
@@ -372,6 +387,7 @@ function readGoal(ctx: ExtensionContext): GoalState | null {
     }
     const data = entry.data as Record<string, unknown>;
     if (typeof data.sessionId === "string" && data.sessionId !== expectedSessionId) continue;
+    if (data.kind === "reload_fence") continue;
     if (data.kind === "patch") {
       if (!current) continue;
       if (typeof data.sessionId !== "string" || data.sessionId !== expectedSessionId) return null;
@@ -393,6 +409,34 @@ function readGoal(ctx: ExtensionContext): GoalState | null {
     current = candidate;
   }
   return current && current.status !== "cleared" ? current : null;
+}
+
+function readReloadFence(ctx: ExtensionContext): ReloadFence | null {
+  const expectedSessionId = sessionId(ctx);
+  let fence: ReloadFence | null = null;
+  for (const entry of ctx.sessionManager.getBranch() as any[]) {
+    if (entry?.type !== "custom" || entry.customType !== STATE_ENTRY || !isRecord(entry.data)) continue;
+    const data = entry.data as Record<string, unknown>;
+    if (data.kind !== "reload_fence" || data.sessionId !== expectedSessionId) continue;
+    if (data.status === "cleared") {
+      fence = null;
+      continue;
+    }
+    if (data.status !== "armed" || !validReloadFence(data)) return null;
+    fence = { token: data.token, goalId: data.goalId };
+  }
+  return fence;
+}
+
+function persistReloadFence(pi: ExtensionAPI, sessionId: string, fence: ReloadFence, status: "armed" | "cleared"): void {
+  pi.appendEntry(STATE_ENTRY, {
+    schemaVersion: 1,
+    kind: "reload_fence",
+    sessionId,
+    token: fence.token,
+    goalId: fence.goalId,
+    status,
+  });
 }
 
 function persist(pi: ExtensionAPI, goal: GoalState): void {
@@ -664,6 +708,7 @@ export default function piGoal(pi: ExtensionAPI) {
     retryCreatedGoal: null,
     staleRetry: false,
     settlementOwner: null,
+    reloadFence: null,
     nextDispatchId: 0,
   };
   let mutationQueue: Promise<unknown> = Promise.resolve();
@@ -686,6 +731,9 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.automaticDispatches.clear();
     rt.automaticRun = null;
     rt.staleAutomaticRun = false;
+    // A reload fence belongs to the abandoned work, not to the current goal
+    // activation. Keep it until that synthetic work is fenced at the provider
+    // boundary or startup proves that no work survived.
     if (rt.retryOwner || rt.retryCreatedGoal) rt.staleRetry = true;
   }
 
@@ -891,7 +939,11 @@ export default function piGoal(pi: ExtensionAPI) {
     // still-active goal eligible to schedule more work.
     advanceActivation();
     ctx.abort();
-    if (ctx.waitForIdle) await ctx.waitForIdle();
+    // TUI ctx.abort() aborts the provider agent but does not cancel Pi's
+    // retry backoff. A retry-only owner has no in-flight provider work to
+    // await; the stale-retry fence will stop it at its eventual provider
+    // boundary, while the lifecycle command can finish immediately.
+    if (ctx.waitForIdle && activeRunOwned) await ctx.waitForIdle();
   }
 
   function validateCreation(objective: string, budget: number | null, maxTurns: number | null): string {
@@ -984,7 +1036,21 @@ export default function piGoal(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", (event, ctx) => {
+    const reloadFence = readReloadFence(ctx);
     reconstruct(ctx, true, event.reason === "fork");
+    if (reloadFence) {
+      if (event.reason === "reload" && !ctx.isIdle()) {
+        // Do not abort here: after replacement there is no ownership evidence
+        // yet, and a queued user prompt may be the first work observed. The
+        // provider boundary distinguishes it from the abandoned synthetic
+        // retry/continuation.
+        rt.reloadFence = reloadFence;
+      } else {
+        // No work survived the boundary, so retire the one-shot fence. This
+        // is a branch-level record because the goal may already be cleared.
+        persistReloadFence(pi, sessionId(ctx), reloadFence, "cleared");
+      }
+    }
     invalidateRestoredEvaluation(ctx);
   });
   // Tree navigation reconstructs state for the selected branch, but does not
@@ -1006,16 +1072,30 @@ export default function piGoal(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", (_event, ctx) => {
     // Reload replaces the extension runtime while Pi may still be streaming.
-    // Fence a goal-owned run before clearing its ownership markers; otherwise
+    // Fence goal-owned work before clearing its ownership markers; otherwise
     // the replacement runtime receives only the tail of an in-flight run and
     // can leave an active goal with no accounting or continuation wake-up.
     const goalOwnedRun = rt.activeRun !== null && (
       rt.activeRun.goalId !== null
       || rt.activeRun.createdGoalId !== undefined
       || rt.activeRun.automaticDispatchId !== undefined
+      || (!rt.activeRun.userOwned && !rt.activeRun.userCandidate)
     );
     const goalOwnedRetry = rt.retryOwner !== null || rt.retryCreatedGoal !== null;
-    if (!ctx.isIdle() && (goalOwnedRun || goalOwnedRetry)) ctx.abort();
+    const goalOwnedSettlement = rt.settlementOwner?.goalId !== null && rt.settlementOwner?.goalId !== undefined;
+    const goalOwnedWork = goalOwnedRun || goalOwnedRetry || goalOwnedSettlement;
+    const fencedGoalId = rt.retryOwner?.goalId
+      ?? rt.retryCreatedGoal?.goalId
+      ?? rt.activeRun?.goalId
+      ?? rt.activeRun?.createdGoalId
+      ?? rt.settlementOwner?.goalId;
+    const fence = goalOwnedWork
+      ? { token: randomUUID().replace(/[^a-z0-9-]/gi, "").toLowerCase().slice(0, 16), goalId: fencedGoalId ?? null }
+      : null;
+    if (!ctx.isIdle() && fence) {
+      persistReloadFence(pi, sessionId(ctx), fence, "armed");
+      ctx.abort();
+    }
     advanceActivation(true);
     rt.automaticDispatches.clear();
     rt.pendingContinuation = null;
@@ -1023,6 +1103,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.retryCreatedGoal = null;
     rt.staleRetry = false;
     rt.settlementOwner = null;
+    rt.reloadFence = null;
     rt.pendingUserRun = null;
     rt.activeRun = null;
     rt.stopNextAgentStart = false;
@@ -1048,7 +1129,16 @@ export default function piGoal(pi: ExtensionAPI) {
   function observeAutomaticDispatch(message: any, ctx: ExtensionContext, markStale = true): boolean {
     if (message?.role !== "custom" || message.customType !== GOAL_CONTINUATION) return false;
     const dispatchId = message.details?.dispatchId;
-    if (typeof dispatchId !== "string") return false;
+    if (typeof dispatchId !== "string") {
+      // Legacy continuations have no runtime-owned dispatch identity. History
+      // scans filter them without mutating the active run; delivery marks the
+      // synthetic run stale so it is aborted before an unowned provider call.
+      if (markStale) {
+        rt.staleAutomaticRun = true;
+        if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+      }
+      return true;
+    }
     const dispatch = rt.automaticDispatches.get(dispatchId);
     if (!dispatch) {
       const token = {
@@ -1210,6 +1300,7 @@ export default function piGoal(pi: ExtensionAPI) {
       ...(automaticRun ? { automaticDispatchId: automaticRun.dispatchId } : {}),
       ...(retryCreatedOwnsRun ? { createdGoalId: goal.id, createdGoalEpoch: rt.activationEpoch } : {}),
       createdGoalRetry: retryCreatedOwnsRun,
+      retryRun: retryOwnsRun || retryCreatedOwnsRun,
       turnsSeen: new Set(),
       hadToolActivity: false,
     };
@@ -1422,6 +1513,32 @@ export default function piGoal(pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
+    // A reload can replace this runtime while Pi's retry timer or provider
+    // loop is still alive. The old TUI abort path does not cancel retry
+    // backoff, so fence the first synthetic provider request in the new
+    // runtime. A real user prompt queued after reload owns the run instead.
+    if (rt.reloadFence) {
+      const fence = rt.reloadFence;
+      const run = rt.activeRun;
+      const userWork = run?.userMessageSeen === true;
+      const differentGoalWork = fence.goalId !== null
+        && run?.goalId !== null
+        && run?.goalId !== undefined
+        && run.goalId !== fence.goalId
+        && run.userCandidate !== true;
+      const knownCurrentContinuation = run?.automaticDispatchId !== undefined && !run.staleSynthetic;
+      const knownCurrentRetry = run?.retryRun === true;
+      const acceptedCurrentWork = userWork || differentGoalWork || knownCurrentContinuation || knownCurrentRetry;
+      // Reaching this boundary with accepted current work proves the
+      // replacement runtime owns it; any pre-reload retry has already settled
+      // or was aborted before this provider request.
+      rt.reloadFence = null;
+      persistReloadFence(pi, sessionId(ctx), fence, "cleared");
+      if (!acceptedCurrentWork) {
+        ctx.abort();
+        return;
+      }
+    }
     // A queued automatic continuation can outlive pause, clear, replacement,
     // or completion. The context hook marks it stale; fence it again at the
     // provider boundary because Pi may already have started the run.
