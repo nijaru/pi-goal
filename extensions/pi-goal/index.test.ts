@@ -806,6 +806,32 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
   });
 
+  test("automatic retries stay alive after a text-only response", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "retry and keep working", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    const retried = assistant(0.1);
+    await endTurn(pi, ctx, retried, 0);
+    await endRun(pi, ctx, [retried]);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+  });
+
   test("does not drop a model-created continuation when another message is pending", async () => {
     const pi = createMockAPI();
     extension(pi as any);

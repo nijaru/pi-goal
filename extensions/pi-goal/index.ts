@@ -1378,7 +1378,7 @@ export default function piGoal(pi: ExtensionAPI) {
       // an active goal stranded with no wake-up. User-owned turns still only
       // hand off after tool activity (or a retry-created goal) so an ordinary
       // user reply does not unexpectedly recurse.
-      const automaticGoalTurn = run.automaticDispatchId !== undefined;
+      const automaticGoalTurn = run.automaticDispatchId !== undefined || (!run.userOwned && run.goalId !== null);
       if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) continuationToken = currentContinuation(goal);
     });
     if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx);
