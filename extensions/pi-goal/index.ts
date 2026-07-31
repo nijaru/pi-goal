@@ -1372,7 +1372,14 @@ export default function piGoal(pi: ExtensionAPI) {
       goal.updatedAt = now();
       persistPatch(pi, goal);
       updateWidget(ctx);
-      if (goal.status === "active" && (run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) continuationToken = currentContinuation(goal);
+      // Automatic goal turns must keep the loop alive even when the model
+      // returns a text-only response. The continuation prompt explicitly
+      // requires concrete work; ending the loop on a no-tool response leaves
+      // an active goal stranded with no wake-up. User-owned turns still only
+      // hand off after tool activity (or a retry-created goal) so an ordinary
+      // user reply does not unexpectedly recurse.
+      const automaticGoalTurn = run.automaticDispatchId !== undefined;
+      if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) continuationToken = currentContinuation(goal);
     });
     if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx);
   });

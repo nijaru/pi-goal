@@ -459,7 +459,10 @@ describe("pi-goal extension", () => {
     ctx.isIdle.mockReturnValue(true);
     ctx.hasPendingMessages.mockReturnValue(false);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
-    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    // The initial kickoff produced a text-only response, so the automatic
+    // loop queued one continuation before the later deferred resume.
+    expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendMessage.mock.calls.at(-1)?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
@@ -780,6 +783,27 @@ describe("pi-goal extension", () => {
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
     expect(state.usage.turns).toBe(2);
     expect(state.usage.cost).toBeCloseTo(0.1);
+  });
+
+  test("automatic continuations stay alive after a text-only response", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "keep working", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    const textOnly = assistant(0.1);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
   });
 
   test("does not drop a model-created continuation when another message is pending", async () => {
