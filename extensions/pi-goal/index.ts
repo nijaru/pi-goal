@@ -134,6 +134,7 @@ interface ActiveRun {
   userCandidate: boolean;
   userMessageSeen: boolean;
   staleSynthetic: boolean;
+  discardUsage: boolean;
   automaticDispatchId?: string;
   createdGoalId?: string;
   createdGoalEpoch?: number;
@@ -153,6 +154,7 @@ interface Runtime {
   goalGeneration: number;
   kickoff: ContinuationRequest | null;
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
+  pendingContinuation: ContinuationRequest | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
   automaticRun: AutomaticDispatch | null;
   staleAutomaticRun: boolean;
@@ -449,8 +451,11 @@ function validateResume(goal: GoalState, requestedBudget?: unknown, requestedMax
   return { budget: nextBudget, maxTurns: nextMaxTurns };
 }
 
-function formatLimit(value: number | null, format: (value: number) => string): string {
-  return value === null ? "unlimited" : format(value);
+function formatConfiguredLimits(goal: Pick<GoalState, "budget" | "maxTurns">): string[] {
+  return [
+    goal.budget === null ? "" : `Budget: ${fmt$(goal.budget)}`,
+    goal.maxTurns === null ? "" : `Max turns: ${goal.maxTurns}`,
+  ].filter(Boolean);
 }
 
 function displayStatus(status: GoalStatus): string {
@@ -460,7 +465,11 @@ function displayStatus(status: GoalStatus): string {
 }
 
 function formatUsage(goal: GoalState): string {
-  return `${fmt$(goal.usage.cost)} / ${formatLimit(goal.budget, fmt$)} · ${goal.usage.totalTokens.toLocaleString()} tokens · ${goal.usage.turns}/${formatLimit(goal.maxTurns, value => String(value))} turns`;
+  const cost = goal.budget === null ? fmt$(goal.usage.cost) : `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`;
+  const turns = goal.maxTurns === null
+    ? `${goal.usage.turns} turn${goal.usage.turns === 1 ? "" : "s"}`
+    : `${goal.usage.turns}/${goal.maxTurns} turns`;
+  return `${cost} · ${goal.usage.totalTokens.toLocaleString()} tokens · ${turns}`;
 }
 
 function goalDetails(goal: GoalState): Record<string, unknown> {
@@ -648,6 +657,7 @@ export default function piGoal(pi: ExtensionAPI) {
     goalGeneration: 0,
     kickoff: null,
     pendingUserRun: null,
+    pendingContinuation: null,
     automaticDispatches: new Map(),
     automaticRun: null,
     staleAutomaticRun: false,
@@ -668,8 +678,9 @@ export default function piGoal(pi: ExtensionAPI) {
   function advanceActivation(newGeneration = false): void {
     rt.activationEpoch = boundedAdd(rt.activationEpoch, 1);
     if (newGeneration) rt.goalGeneration = boundedAdd(rt.goalGeneration, 1);
-    if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
+    if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.createdGoalId !== undefined || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
     rt.kickoff = null;
+    rt.pendingContinuation = null;
     rt.automaticRun = null;
     rt.staleAutomaticRun = false;
     if (rt.retryOwner || rt.retryCreatedGoal) rt.staleRetry = true;
@@ -720,9 +731,10 @@ export default function piGoal(pi: ExtensionAPI) {
         const color = goal.status === "complete" ? "success" : goal.status === "active" ? "accent" : goal.status === "blocked" ? "error" : "warning";
         const icon = goal.status === "complete" ? "✓" : goal.status === "active" ? "◉" : goal.status === "blocked" ? "⊘" : goal.status === "cleared" ? "×" : "⏸";
         const title = " Goal ";
+        const usage = `${goal.budget === null ? fmt$(goal.usage.cost) : `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`} · ${goal.maxTurns === null ? `${goal.usage.turns} turn${goal.usage.turns === 1 ? "" : "s"}` : `${goal.usage.turns}/${goal.maxTurns} turns`}`;
         return [
           truncateToWidth(theme.fg("borderMuted", "───") + theme.fg("accent", title) + theme.fg("borderMuted", "─".repeat(Math.max(0, w - 4 - visibleWidth(title)))), w),
-          truncateToWidth(`  ${theme.fg(color, `${icon} ${displayStatus(goal.status)}`)}  ${theme.fg("muted", `turns: ${goal.usage.turns}/${formatLimit(goal.maxTurns, value => String(value))}`)}  ${theme.fg("muted", `cost: ${fmt$(goal.usage.cost)} / ${formatLimit(goal.budget, fmt$)}`)}`, w),
+          truncateToWidth(`  ${theme.fg(color, `${icon} ${displayStatus(goal.status)}`)}  ${theme.fg("muted", usage)}`, w),
           truncateToWidth(`  ${theme.fg("dim", truncate(goal.objective, Math.max(1, w - 4)))}`, w),
         ];
       },
@@ -792,7 +804,11 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function sendContinuation(goal: GoalState): void {
     const token = currentContinuation(goal);
-    if (hasAutomaticDispatch(token)) return;
+    if (hasAutomaticDispatch(token)) {
+      rt.pendingContinuation = null;
+      return;
+    }
+    rt.pendingContinuation = null;
     const dispatch: AutomaticDispatch = { ...token, dispatchId: nextDispatchId() };
     rt.automaticDispatches.set(dispatch.dispatchId, dispatch);
     // Pi checks auto-compaction before draining follow-ups queued from
@@ -806,19 +822,36 @@ export default function piGoal(pi: ExtensionAPI) {
     }, { triggerTurn: true, deliverAs: "followUp" });
   }
 
-  function queueContinuation(ctx: ExtensionContext): void {
-    if (!rt.goal || rt.goal.status !== "active") return;
-    void mutate(() => {
-      if (!rt.goal || rt.goal.status !== "active" || ctx.hasPendingMessages()) return;
-      if (markLimitIfNeeded(rt.goal)) {
-        persistPatch(pi, rt.goal);
+  async function queueContinuation(ctx: ExtensionContext): Promise<void> {
+    await mutate(() => {
+      if (!rt.goal || rt.goal.status !== "active") return;
+      const goal = rt.goal;
+      const token = currentContinuation(goal);
+      rt.pendingContinuation = token;
+      if (markLimitIfNeeded(goal)) {
+        rt.pendingContinuation = null;
+        persistPatch(pi, goal);
         updateWidget(ctx);
         return;
       }
-      const goal = rt.goal;
+      // Keep the token until settlement if another prompt is already queued.
+      // Dropping it here leaves an active goal with no future wake-up.
+      if (ctx.hasPendingMessages()) return;
       if (rt.kickoff?.goalId === goal.id && rt.kickoff.activationEpoch === rt.activationEpoch) rt.kickoff = null;
       sendContinuation(goal);
     });
+  }
+
+  function drainPendingContinuation(ctx: ExtensionContext): void {
+    const token = rt.pendingContinuation;
+    if (!token) return;
+    if (!matchesCurrentContinuation(token)) {
+      rt.pendingContinuation = null;
+      return;
+    }
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    rt.pendingContinuation = null;
+    sendContinuation(rt.goal!);
   }
 
   function startUserContinuation(ctx: ExtensionContext): void {
@@ -908,11 +941,16 @@ export default function piGoal(pi: ExtensionAPI) {
 
   // Session entries are the canonical store. Reconstructing from the current
   // branch prevents goals from leaking between sessions or /tree branches.
-  const reconstruct = (ctx: ExtensionContext, startContinuation: boolean, isolateFork: boolean): void => {
+  const reconstruct = (ctx: ExtensionContext, startContinuation: boolean, isolateFork: boolean, preserveSettlementOwner = false, preserveActiveRun = false): void => {
     advanceActivation(true);
     rt.automaticDispatches.clear();
+    rt.pendingContinuation = null;
+    rt.retryOwner = null;
+    rt.retryCreatedGoal = null;
+    rt.staleRetry = false;
+    if (!preserveSettlementOwner) rt.settlementOwner = null;
     rt.pendingUserRun = null;
-    rt.activeRun = null;
+    if (!preserveActiveRun) rt.activeRun = null;
     rt.stopNextAgentStart = false;
     rt.userInputQueued = false;
     rt.startupPending = startContinuation;
@@ -947,13 +985,27 @@ export default function piGoal(pi: ExtensionAPI) {
   // start a turn until the user submits a prompt in that branch. The working
   // tree may not match the selected branch, so prior evaluation is stale.
   pi.on("session_tree", async (event: SessionTreeEvent, ctx) => {
-    reconstruct(ctx, false, false);
+    // Tree navigation can be requested while a run is streaming. Fence that
+    // run before replacing the branch state; its stale provider work must not
+    // reach the selected branch or be charged to its reconstructed goal.
+    if (!ctx.isIdle()) ctx.abort();
+    reconstruct(ctx, false, false, true, true);
+    if (rt.activeRun) rt.activeRun.discardUsage = true;
     invalidateRestoredEvaluation(ctx);
+    const settlementOwner = rt.settlementOwner;
     await accountAuxiliaryUsage(event.summaryEntry?.usage, ctx);
+    // Any pre-navigation settlement attribution has now been consumed. Do not
+    // clear a marker installed by a stale agent_end that raced this await.
+    if (rt.settlementOwner === settlementOwner) rt.settlementOwner = null;
   });
   pi.on("session_shutdown", () => {
     advanceActivation(true);
     rt.automaticDispatches.clear();
+    rt.pendingContinuation = null;
+    rt.retryOwner = null;
+    rt.retryCreatedGoal = null;
+    rt.staleRetry = false;
+    rt.settlementOwner = null;
     rt.pendingUserRun = null;
     rt.activeRun = null;
     rt.stopNextAgentStart = false;
@@ -1131,6 +1183,7 @@ export default function piGoal(pi: ExtensionAPI) {
       userCandidate: userInputQueued,
       userMessageSeen: false,
       staleSynthetic: staleAutomaticRun || staleRetryRun,
+      discardUsage: false,
       ...(automaticRun ? { automaticDispatchId: automaticRun.dispatchId } : {}),
       ...(retryCreatedOwnsRun ? { createdGoalId: goal.id, createdGoalEpoch: rt.activationEpoch } : {}),
       createdGoalRetry: retryCreatedOwnsRun,
@@ -1201,6 +1254,9 @@ export default function piGoal(pi: ExtensionAPI) {
       if (!run || run.turnsSeen.has(event.turnIndex)) return;
       run.turnsSeen.add(event.turnIndex);
       run.hadToolActivity ||= (event.toolResults?.length ?? 0) > 0 || hasToolActivity([event.message]);
+      // Tree reconstruction fenced this run. Its provider result belongs to
+      // the abandoned branch and must not mutate or charge the replacement.
+      if (run.discardUsage) return;
       if (!run.goal || !run.goalId) return;
 
       const currentGoal = rt.goal;
@@ -1306,7 +1362,7 @@ export default function piGoal(pi: ExtensionAPI) {
       updateWidget(ctx);
       if (goal.status === "active" && (run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) continuationToken = currentContinuation(goal);
     });
-    if (continuationToken && matchesCurrentContinuation(continuationToken)) queueContinuation(ctx);
+    if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx);
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -1318,6 +1374,7 @@ export default function piGoal(pi: ExtensionAPI) {
       rt.automaticDispatches.clear();
       rt.retryOwner = null;
       rt.retryCreatedGoal = null;
+      drainPendingContinuation(ctx);
       return;
     }
     rt.retryOwner = null;
@@ -1328,7 +1385,9 @@ export default function piGoal(pi: ExtensionAPI) {
       return;
     }
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    rt.pendingContinuation = null;
     startUserContinuation(ctx);
+    drainPendingContinuation(ctx);
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
@@ -1427,13 +1486,26 @@ export default function piGoal(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, ctx) {
       return mutate(() => {
         const goal = createGoal(params.objective, params.budget ?? null, params.maxTurns ?? null, ctx, false, true);
+        const limits = formatConfiguredLimits(goal);
         return {
-          content: [{ type: "text" as const, text: `Goal created\nObjective: ${goal.objective}\nBudget: ${formatLimit(goal.budget, fmt$)}\nMax turns: ${formatLimit(goal.maxTurns, value => String(value))}\n\nThe goal is session-scoped. Start or resume its loop with a user command or a subsequent session prompt.` }],
+          content: [{ type: "text" as const, text: [
+            "Goal created",
+            `Objective: ${goal.objective}`,
+            ...limits,
+            "",
+            "The goal loop will continue automatically after this turn.",
+          ].join("\n") }],
           details: { goal: goalDetails(goal) },
         };
       });
     },
-    renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 50)) + theme.fg("dim", args.budget === undefined ? " (unlimited)" : ` (${fmt$(args.budget)})`), 0, 0); },
+    renderCall(args, theme) {
+      const limits = [
+        args.budget === undefined ? "" : fmt$(args.budget),
+        args.maxTurns === undefined ? "" : `${args.maxTurns} turns`,
+      ].filter(Boolean).join(", ");
+      return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 50)) + (limits ? theme.fg("dim", ` (${limits})`) : ""), 0, 0);
+    },
     renderResult: renderText,
   });
 
@@ -1781,7 +1853,8 @@ export default function piGoal(pi: ExtensionAPI) {
         validateCreation(spec.objective, spec.budget, spec.maxTurns);
         await abortActiveRunForUserCommand(ctx);
         const goal = await mutate(() => createGoal(spec.objective, spec.budget, spec.maxTurns, ctx, true));
-        ctx.ui.notify(`Goal started: ${goal.objective}\nBudget: ${formatLimit(goal.budget, fmt$)} · max turns: ${formatLimit(goal.maxTurns, value => String(value))}`, "info");
+        const limits = formatConfiguredLimits(goal);
+        ctx.ui.notify([`Goal started: ${goal.objective}`, ...limits].join("\n"), "info");
         scheduleResume(ctx);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

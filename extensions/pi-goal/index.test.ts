@@ -145,8 +145,8 @@ describe("pi-goal extension", () => {
     const result = await pi.getTool("create_goal").execute("1", { objective: "run until done" }, undefined, undefined, ctx);
     expect(result.details.goal.budget).toBeNull();
     expect(result.details.goal.maxTurns).toBeNull();
-    expect(result.content[0].text).toContain("Budget: unlimited");
-    expect(result.content[0].text).toContain("Max turns: unlimited");
+    expect(result.content[0].text).not.toContain("unlimited");
+    expect(result.content[0].text).toContain("The goal loop will continue automatically after this turn.");
     const restored = createMockAPI(pi.entries);
     extension(restored as any);
     const restoredCtx = createMockCtx(restored.entries);
@@ -322,6 +322,22 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
     expect(pi.sendMessage.mock.calls[0]?.[0].content).toContain("tree goal");
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("tree navigation fences a streaming goal run before reconstruction", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "tree fence", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+    await pi.handlers.get("session_tree")({ type: "session_tree", newLeafId: "leaf", oldLeafId: null }, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+    await endTurn(pi, ctx, assistant(0.2, 10, 5, 15, true), 0);
+    await endRun(pi, ctx, [{ ...assistant(0.2, 10, 5, 15, true), stopReason: "aborted" }]);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(state.usage.turns).toBe(0);
   });
 
   test("tree reconstruction invalidates an achieved evaluation", async () => {
@@ -725,6 +741,36 @@ describe("pi-goal extension", () => {
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
   });
 
+  test("tool-created goals queue a continuation after the creating turn", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await startRun(pi, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "created in user turn", budget: 5 }, undefined, undefined, ctx);
+    const message = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, message, 0);
+    await endRun(pi, ctx, [message]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.usage.turns).toBe(0);
+  });
+
+  test("does not drop a model-created continuation when another message is pending", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await startRun(pi, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "deferred creation", budget: 5 }, undefined, undefined, ctx);
+    const message = assistant(0, 10, 5, 15, true);
+    ctx.hasPendingMessages.mockReturnValue(true);
+    await endTurn(pi, ctx, message, 0);
+    await endRun(pi, ctx, [message]);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    ctx.hasPendingMessages.mockReturnValue(false);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("tool-created goals continue after an automatic retry", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -739,6 +785,25 @@ describe("pi-goal extension", () => {
     await endTurn(pi, ctx, retried, 0);
     await endRun(pi, ctx, [retried]);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("reconstruction clears retry ownership from a prior runtime", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries, "session-a");
+    await pi.getTool("create_goal").execute("1", { objective: "restart after failure", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1, 10, 5, 15, true), stopReason: "error" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+
+    pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    await pi.getCommand("goal").handler("resume", ctx);
+    const queued = pi.sendMessage.mock.calls.at(-1)?.[0];
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
   });
 
   test("charges a cleared-at-runtime goal only on its tombstone", async () => {
