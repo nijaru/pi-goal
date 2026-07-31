@@ -466,10 +466,9 @@ function displayStatus(status: GoalStatus): string {
 
 function formatUsage(goal: GoalState): string {
   const cost = goal.budget === null ? fmt$(goal.usage.cost) : `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`;
-  const turns = goal.maxTurns === null
-    ? `${goal.usage.turns} turn${goal.usage.turns === 1 ? "" : "s"}`
-    : `${goal.usage.turns}/${goal.maxTurns} turns`;
-  return `${cost} · ${goal.usage.totalTokens.toLocaleString()} tokens · ${turns}`;
+  const parts = [cost, `${goal.usage.totalTokens.toLocaleString()} tokens`];
+  if (goal.maxTurns !== null) parts.push(`${goal.usage.turns}/${goal.maxTurns} turns`);
+  return parts.join(" · ");
 }
 
 function goalDetails(goal: GoalState): Record<string, unknown> {
@@ -731,7 +730,10 @@ export default function piGoal(pi: ExtensionAPI) {
         const color = goal.status === "complete" ? "success" : goal.status === "active" ? "accent" : goal.status === "blocked" ? "error" : "warning";
         const icon = goal.status === "complete" ? "✓" : goal.status === "active" ? "◉" : goal.status === "blocked" ? "⊘" : goal.status === "cleared" ? "×" : "⏸";
         const title = " Goal ";
-        const usage = `${goal.budget === null ? fmt$(goal.usage.cost) : `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`} · ${goal.maxTurns === null ? `${goal.usage.turns} turn${goal.usage.turns === 1 ? "" : "s"}` : `${goal.usage.turns}/${goal.maxTurns} turns`}`;
+        const usage = [
+          goal.budget === null ? fmt$(goal.usage.cost) : `${fmt$(goal.usage.cost)} / ${fmt$(goal.budget)}`,
+          ...(goal.maxTurns === null ? [] : [`${goal.usage.turns}/${goal.maxTurns} turns`]),
+        ].join(" · ");
         return [
           truncateToWidth(theme.fg("borderMuted", "───") + theme.fg("accent", title) + theme.fg("borderMuted", "─".repeat(Math.max(0, w - 4 - visibleWidth(title)))), w),
           truncateToWidth(`  ${theme.fg(color, `${icon} ${displayStatus(goal.status)}`)}  ${theme.fg("muted", usage)}`, w),

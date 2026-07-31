@@ -147,6 +147,11 @@ describe("pi-goal extension", () => {
     expect(result.details.goal.maxTurns).toBeNull();
     expect(result.content[0].text).not.toContain("unlimited");
     expect(result.content[0].text).toContain("The goal loop will continue automatically after this turn.");
+    await startRun(pi, ctx);
+    await endTurn(pi, ctx, assistant(0.01), 0);
+    const status = await pi.getTool("get_goal").execute("1b", {}, undefined, undefined, ctx);
+    expect(status.content[0].text).toContain("Usage: $0.01 · 15 tokens");
+    expect(status.content[0].text).not.toContain("turn");
     const restored = createMockAPI(pi.entries);
     extension(restored as any);
     const restoredCtx = createMockCtx(restored.entries);
@@ -562,6 +567,7 @@ describe("pi-goal extension", () => {
     const state = await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx);
     expect(state.content[0].text).toContain("Fix the auth bug");
     expect(state.content[0].text).toContain("$0.00 / $2.00");
+    expect(state.content[0].text).toContain("0/3 turns");
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
