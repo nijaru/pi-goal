@@ -359,6 +359,35 @@ describe("pi-goal extension", () => {
     await expect(update.execute("4", { status: "complete" }, undefined, undefined, ctx)).rejects.toThrow("Completion requires");
   });
 
+  test("reload aborts a goal-owned run before replacing runtime ownership", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "reload-safe", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+
+    pi.handlers.get("session_start")({ type: "session_start", reason: "reload" }, ctx);
+    await endTurn(pi, ctx, { ...assistant(0), stopReason: "aborted" }, 0);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(state.usage.turns).toBe(0);
+  });
+
+  test("reload does not abort an unrelated run", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+
+    pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
   test("compaction snapshots state without replacing Pi's normal summary or starting work", async () => {
     const pi = createMockAPI();
     extension(pi as any);

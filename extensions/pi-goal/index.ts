@@ -1004,7 +1004,18 @@ export default function piGoal(pi: ExtensionAPI) {
     // clear a marker installed by a stale agent_end that raced this await.
     if (rt.settlementOwner === settlementOwner) rt.settlementOwner = null;
   });
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    // Reload replaces the extension runtime while Pi may still be streaming.
+    // Fence a goal-owned run before clearing its ownership markers; otherwise
+    // the replacement runtime receives only the tail of an in-flight run and
+    // can leave an active goal with no accounting or continuation wake-up.
+    const goalOwnedRun = rt.activeRun !== null && (
+      rt.activeRun.goalId !== null
+      || rt.activeRun.createdGoalId !== undefined
+      || rt.activeRun.automaticDispatchId !== undefined
+    );
+    const goalOwnedRetry = rt.retryOwner !== null || rt.retryCreatedGoal !== null;
+    if (!ctx.isIdle() && (goalOwnedRun || goalOwnedRetry)) ctx.abort();
     advanceActivation(true);
     rt.automaticDispatches.clear();
     rt.pendingContinuation = null;
