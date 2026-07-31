@@ -833,6 +833,31 @@ describe("pi-goal extension", () => {
     expect(ctx.abort).not.toHaveBeenCalled();
   });
 
+  test("resumes a persisted paused goal without aborting its kickoff", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries, "session-a");
+    await pi.getTool("create_goal").execute("1", { objective: "restart after interruption", budget: 5 }, undefined, undefined, ctx);
+    await pi.getCommand("goal").handler("pause", ctx);
+
+    pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    await pi.getCommand("goal").handler("resume", ctx);
+    const queued = pi.sendMessage.mock.calls.at(-1)?.[0];
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    pi.handlers.get("context")({ type: "context", messages: [
+      {
+        role: "custom",
+        customType: "pi-goal/continuation",
+        content: "stale historical continuation",
+        details: { goalId: "2b7e6c95-bc5", activationId: "old-activation", activationEpoch: 1, dispatchId: "old-dispatch" },
+      },
+      { role: "custom", ...queued },
+    ] }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
   test("charges a cleared-at-runtime goal only on its tombstone", async () => {
     const pi = createMockAPI();
     extension(pi as any);

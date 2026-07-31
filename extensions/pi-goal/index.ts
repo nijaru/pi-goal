@@ -1034,7 +1034,7 @@ export default function piGoal(pi: ExtensionAPI) {
     }
   }
 
-  function observeAutomaticDispatch(message: any, ctx: ExtensionContext): boolean {
+  function observeAutomaticDispatch(message: any, ctx: ExtensionContext, markStale = true): boolean {
     if (message?.role !== "custom" || message.customType !== GOAL_CONTINUATION) return false;
     const dispatchId = message.details?.dispatchId;
     if (typeof dispatchId !== "string") return false;
@@ -1046,8 +1046,14 @@ export default function piGoal(pi: ExtensionAPI) {
         activationEpoch: message.details?.activationEpoch,
       };
       if (typeof token.goalId === "string" && typeof token.activationId === "string" && typeof token.activationEpoch === "number" && !matchesCurrentContinuation(token)) {
-        rt.staleAutomaticRun = true;
-        if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+        // The context hook sees persisted transcript entries as well as the
+        // message being delivered. Historical stale continuations must be
+        // filtered without aborting the current run; message_start is the
+        // delivery boundary that marks an automatic run stale.
+        if (markStale) {
+          rt.staleAutomaticRun = true;
+          if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+        }
         return true;
       }
       return false;
@@ -1231,7 +1237,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("context", (event, ctx) => {
     // Consume dispatch identity before filtering so a stale queued follow-up
     // can be fenced at before_provider_request instead of reaching the model.
-    const messages = event.messages.filter(message => !observeAutomaticDispatch(message, ctx) && !observeStaleDeliveredAutomatic(message) && !isStaleGoalContextMessage(message));
+    const messages = event.messages.filter(message => !observeAutomaticDispatch(message, ctx, false) && !observeStaleDeliveredAutomatic(message) && !isStaleGoalContextMessage(message));
     const goal = rt.goal;
     if (!goal || goal.status !== "active") {
       return { messages: messages.filter(message => !isGoalMessage(message)) };
