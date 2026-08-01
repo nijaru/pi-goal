@@ -502,6 +502,52 @@ describe("pi-goal extension", () => {
     expect(replacementCtx.abort).toHaveBeenCalled();
   });
 
+  test("does not restore a completed force-action pair after reload", async () => {
+    const source = createMockAPI();
+    extension(source as any);
+    const sourceCtx: any = createMockCtx(source.entries, "session-test");
+    const result = await source.getTool("create_goal").execute("1", { objective: "completed nudge", budget: 5 }, undefined, undefined, sourceCtx);
+    const marker = {
+      type: "custom_message",
+      customType: "pi-goal/continuation",
+      content: "completed force action",
+      details: { goalId: result.details.goal.id, activationId: "old-activation", activationEpoch: 4, dispatchId: "completed-dispatch", forceAction: true },
+    };
+    source.entries.push(marker, {
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: marker.content }] },
+    });
+
+    const replacement = createMockAPI(source.entries);
+    extension(replacement as any);
+    const replacementCtx: any = createMockCtx(replacement.entries, "session-test");
+    replacement.handlers.get("session_start")({ type: "session_start", reason: "reload" }, replacementCtx);
+    replacement.handlers.get("input")({ type: "input", text: marker.content, source: "interactive" }, replacementCtx);
+    replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
+    replacement.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: marker.content }] } }, replacementCtx);
+    replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
+    expect(replacementCtx.abort).not.toHaveBeenCalled();
+  });
+
+  test("context scans do not resurrect historical force-action nudges", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    const result = await pi.getTool("create_goal").execute("1", { objective: "historical nudge", budget: 5 }, undefined, undefined, ctx);
+    const marker = {
+      role: "custom",
+      customType: "pi-goal/continuation",
+      content: "historical force action",
+      details: { goalId: result.details.goal.id, activationId: "old-activation", activationEpoch: 4, dispatchId: "historical-dispatch", forceAction: true },
+    };
+    pi.handlers.get("context")({ type: "context", messages: [marker] }, ctx);
+    pi.handlers.get("input")({ type: "input", text: marker.content, source: "interactive" }, ctx);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: marker.content }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
   test("clear preserves a retry fence across reload", async () => {
     const pi = createMockAPI();
     extension(pi as any);

@@ -830,13 +830,35 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function restoreAutomaticUserNudges(ctx: ExtensionContext): void {
     // A force-action marker is persisted before its paired user message is
-    // started. Rebuild that identity after reload so the queued user message
-    // cannot be mistaken for a fresh interactive prompt in the replacement
-    // runtime.
+    // started. Rebuild only identities whose pair is still pending after
+    // reload. Historical markers whose user message was already persisted are
+    // complete; restoring them would make a later identical user prompt look
+    // stale and abort unrelated work.
+    const pending = new Map<string, any>();
     for (const entry of ctx.sessionManager.getBranch() as any[]) {
-      if (entry?.type !== "custom_message" || entry.customType !== GOAL_CONTINUATION) continue;
-      rememberAutomaticUserNudgeFromMessage({ role: "custom", content: entry.content, details: entry.details });
+      if (entry?.type === "custom_message" && entry.customType === GOAL_CONTINUATION && entry.details?.forceAction === true) {
+        const marker = { role: "custom", content: entry.content, details: entry.details };
+        const dispatchId = entry.details?.dispatchId;
+        if (typeof dispatchId === "string") {
+          pending.set(dispatchId, marker);
+          while (pending.size > MAX_AUTOMATIC_USER_NUDGES) {
+            const oldest = pending.keys().next().value;
+            if (typeof oldest !== "string") break;
+            pending.delete(oldest);
+          }
+        }
+        continue;
+      }
+      if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+      const content = textContent(entry.message);
+      if (!content) continue;
+      for (const [dispatchId, marker] of pending) {
+        if (textContent(marker) !== content) continue;
+        pending.delete(dispatchId);
+        break;
+      }
     }
+    for (const marker of pending.values()) rememberAutomaticUserNudgeFromMessage(marker);
   }
 
   function syncActiveTools(): void {
@@ -1254,7 +1276,10 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function observeAutomaticDispatch(message: any, ctx: ExtensionContext, markStale = true): boolean {
     if (message?.role !== "custom" || message.customType !== GOAL_CONTINUATION) return false;
-    rememberAutomaticUserNudgeFromMessage(message);
+    // Context scans include historical entries. Do not resurrect a consumed
+    // force-action nudge there; message_start and reload reconstruction own
+    // the pending-pair identity.
+    if (markStale) rememberAutomaticUserNudgeFromMessage(message);
     const dispatchId = message.details?.dispatchId;
     if (typeof dispatchId !== "string") {
       // Legacy continuations have no runtime-owned dispatch identity. History
