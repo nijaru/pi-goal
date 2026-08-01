@@ -585,6 +585,7 @@ describe("pi-goal extension", () => {
     await startRun(pi, ctx);
     ctx.isIdle.mockReturnValue(false);
     pi.sendMessage.mockClear();
+    pi.sendUserMessage.mockClear();
     await pi.getCommand("goal").handler("resume", ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
     expect(pi.sendMessage).not.toHaveBeenCalled();
@@ -601,6 +602,7 @@ describe("pi-goal extension", () => {
     const ctx: any = createMockCtx(pi.entries);
     await pi.getCommand("goal").handler("paused goal", ctx);
     await settleKickoff(pi, ctx);
+    pi.sendUserMessage.mockClear();
     await pi.getCommand("goal").handler("pause", ctx);
     await startRun(pi, ctx);
     ctx.isIdle.mockReturnValue(false);
@@ -1001,6 +1003,8 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
     expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage.mock.calls[0]?.[0]).toBe(pi.sendMessage.mock.calls[1]?.[0].content);
   });
 
   test("preserves the forced-action continuation when delivery is deferred", async () => {
@@ -1026,6 +1030,62 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("force-action user nudges retain current goal ownership", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "current force action", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const firstQueued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstQueued } }, ctx);
+    const textOnly = assistant(0.1);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+    const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
+    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
+    pi.handlers.get("input")({ type: "input", text: nudge, source: "extension" }, ctx);
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
+  test("stale force-action user nudges are fenced after clear", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "stale force action", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const firstQueued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstQueued } }, ctx);
+    const textOnly = assistant(0.1);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+    const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
+    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
+    pi.handlers.get("input")({ type: "input", text: nudge, source: "extension" }, ctx);
+    await pi.getCommand("goal").handler("clear", ctx);
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalled();
   });
 
   test("automatic retries stay alive after a text-only response", async () => {

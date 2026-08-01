@@ -140,6 +140,7 @@ interface ActiveRun {
   userCandidate: boolean;
   userMessageSeen: boolean;
   staleSynthetic: boolean;
+  staleAutomaticUserMessage: boolean;
   discardUsage: boolean;
   automaticDispatchId?: string;
   createdGoalId?: string;
@@ -869,14 +870,19 @@ export default function piGoal(pi: ExtensionAPI) {
     const dispatch: AutomaticDispatch = { ...token, dispatchId: nextDispatchId() };
     rt.automaticDispatches.set(dispatch.dispatchId, dispatch);
     // Pi checks auto-compaction before draining follow-ups queued from
-    // agent_end. Explicit kickoffs use the same hidden custom-message path so
-    // they cannot race a normal user prompt's preflight or appear as user work.
+    // agent_end. Keep the custom dispatch marker hidden so lifecycle fencing
+    // can identify stale work. When a prior automatic turn returned only
+    // prose, also queue the same instruction as an actual user message: the
+    // model must receive a fresh actionable prompt rather than treating the
+    // hidden continuation as a status update.
+    const content = buildContinuationPrompt(goal, forceAction);
     pi.sendMessage({
       customType: GOAL_CONTINUATION,
-      content: buildContinuationPrompt(goal, forceAction),
+      content,
       display: false,
       details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId },
     }, { triggerTurn: true, deliverAs: "followUp" });
+    if (forceAction) void pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
   async function queueContinuation(ctx: ExtensionContext, forceAction = false): Promise<void> {
@@ -1214,6 +1220,7 @@ export default function piGoal(pi: ExtensionAPI) {
     if (event.message?.role !== "user") return;
     const run = rt.activeRun;
     if (!run) return;
+    const staleAutomaticUserMessage = rt.staleAutomaticRun && !rt.userInputQueued;
     const stillOwned = run.goalId !== null
       && rt.goal?.status === "active"
       && run.goalGeneration === rt.goalGeneration
@@ -1228,11 +1235,12 @@ export default function piGoal(pi: ExtensionAPI) {
       run.automaticDispatchId = undefined;
       run.staleSynthetic = false;
     }
-    if (run.goalId === null && !run.userCandidate && rt.goal?.status === "active") bindActiveRunToGoal(rt.goal, true, ctx);
+    if (run.goalId === null && !run.userCandidate && !staleAutomaticUserMessage && rt.goal?.status === "active") bindActiveRunToGoal(rt.goal, true, ctx);
     run.userOwned = true;
     run.userMessageSeen = true;
-    run.staleSynthetic = run.staleSynthetic && run.goalId !== null;
-    rt.staleAutomaticRun = false;
+    run.staleSynthetic = (run.staleSynthetic && run.goalId !== null) || staleAutomaticUserMessage;
+    run.staleAutomaticUserMessage = staleAutomaticUserMessage;
+    if (!staleAutomaticUserMessage) rt.staleAutomaticRun = false;
   });
   pi.on("agent_start", (_event: AgentStartEvent, ctx) => {
     syncActiveTools();
@@ -1299,6 +1307,7 @@ export default function piGoal(pi: ExtensionAPI) {
       userCandidate: userInputQueued,
       userMessageSeen: false,
       staleSynthetic: staleAutomaticRun || staleRetryRun,
+      staleAutomaticUserMessage: false,
       discardUsage: false,
       ...(automaticRun ? { automaticDispatchId: automaticRun.dispatchId } : {}),
       ...(retryCreatedOwnsRun ? { createdGoalId: goal.id, createdGoalEpoch: rt.activationEpoch } : {}),
@@ -1549,7 +1558,7 @@ export default function piGoal(pi: ExtensionAPI) {
     // A queued automatic continuation can outlive pause, clear, replacement,
     // or completion. The context hook marks it stale; fence it again at the
     // provider boundary because Pi may already have started the run.
-    if (rt.activeRun?.staleSynthetic && (rt.activeRun.activationEpoch !== rt.activationEpoch || rt.activeRun.goalGeneration !== rt.goalGeneration || !rt.activeRun.userMessageSeen)) {
+    if (rt.activeRun?.staleSynthetic && (rt.activeRun.staleAutomaticUserMessage || rt.activeRun.activationEpoch !== rt.activationEpoch || rt.activeRun.goalGeneration !== rt.goalGeneration || !rt.activeRun.userMessageSeen)) {
       rt.staleAutomaticRun = false;
       ctx.abort();
       return;
