@@ -37,6 +37,7 @@ const MAX_TEXT = 1_000;
 const MAX_EVIDENCE = 2_000;
 const MAX_ITERATIONS = 500;
 const MAX_IDEAS = 100;
+const MAX_AUTOMATIC_USER_NUDGES = 64;
 const GOAL_PROGRESS_TOOLS = ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"] as const;
 
 // ---------------------------------------------------------------------------
@@ -131,6 +132,10 @@ interface AutomaticDispatch extends ContinuationRequest {
   dispatchId: string;
 }
 
+interface AutomaticUserNudge extends AutomaticDispatch {
+  content: string;
+}
+
 interface ActiveRun {
   goalId: string | null;
   goalGeneration: number;
@@ -164,6 +169,7 @@ interface Runtime {
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
   pendingContinuation: { token: ContinuationRequest; forceAction: boolean } | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
+  automaticUserNudges: Map<string, AutomaticUserNudge>;
   automaticRun: AutomaticDispatch | null;
   staleAutomaticRun: boolean;
   retryOwner: { goalId: string; goalGeneration: number; activationEpoch: number } | null;
@@ -610,6 +616,16 @@ function hasToolActivity(messages: any[]): boolean {
   });
 }
 
+function textContent(message: any): string | null {
+  if (typeof message?.content === "string") return message.content;
+  if (!Array.isArray(message?.content)) return null;
+  const text = message.content
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("\n");
+  return text || null;
+}
+
 function isEvaluationHandoff(event: ToolCallEvent, goal: GoalState | null): boolean {
   if (event.toolName !== "subagent" || !goal?.evaluationRequested || !isRecord(event.input)) return false;
   // Only a single evaluator task can use the pending token. Parallel and
@@ -706,6 +722,7 @@ export default function piGoal(pi: ExtensionAPI) {
     pendingUserRun: null,
     pendingContinuation: null,
     automaticDispatches: new Map(),
+    automaticUserNudges: new Map(),
     automaticRun: null,
     staleAutomaticRun: false,
     retryOwner: null,
@@ -759,6 +776,48 @@ export default function piGoal(pi: ExtensionAPI) {
   function nextDispatchId(): string {
     rt.nextDispatchId = boundedAdd(rt.nextDispatchId, 1);
     return `${rt.activationId}-${rt.activationEpoch}-${rt.nextDispatchId}`;
+  }
+
+  function rememberAutomaticUserNudge(dispatch: AutomaticDispatch, content: string): void {
+    rt.automaticUserNudges.set(dispatch.dispatchId, { ...dispatch, content });
+    while (rt.automaticUserNudges.size > MAX_AUTOMATIC_USER_NUDGES) {
+      const oldest = rt.automaticUserNudges.keys().next().value;
+      if (typeof oldest !== "string") break;
+      rt.automaticUserNudges.delete(oldest);
+    }
+  }
+
+  function rememberAutomaticUserNudgeFromMessage(message: any): void {
+    if (message?.details?.forceAction !== true) return;
+    const dispatchId = message.details?.dispatchId;
+    const goalId = message.details?.goalId;
+    const activationId = message.details?.activationId;
+    const activationEpoch = message.details?.activationEpoch;
+    const content = textContent(message);
+    if (typeof dispatchId !== "string" || typeof goalId !== "string" || typeof activationId !== "string" || !isBoundedInteger(activationEpoch, MAX_PERSISTED_NUMBER) || !content) return;
+    rememberAutomaticUserNudge({ dispatchId, goalId, activationId, activationEpoch }, content);
+  }
+
+  function consumeAutomaticUserNudge(message: any): AutomaticUserNudge | null {
+    if (message?.role !== "user") return null;
+    const content = textContent(message);
+    if (!content) return null;
+    const activeDispatchId = rt.activeRun?.automaticDispatchId;
+    if (activeDispatchId) {
+      const current = rt.automaticUserNudges.get(activeDispatchId);
+      if (current?.content === content) {
+        rt.automaticUserNudges.delete(activeDispatchId);
+        rt.automaticDispatches.delete(activeDispatchId);
+        return current;
+      }
+    }
+    for (const [dispatchId, nudge] of rt.automaticUserNudges) {
+      if (nudge.content !== content) continue;
+      rt.automaticUserNudges.delete(dispatchId);
+      rt.automaticDispatches.delete(dispatchId);
+      return nudge;
+    }
+    return null;
   }
 
   function syncActiveTools(): void {
@@ -880,9 +939,12 @@ export default function piGoal(pi: ExtensionAPI) {
       customType: GOAL_CONTINUATION,
       content,
       display: false,
-      details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId },
+      details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId, forceAction },
     }, { triggerTurn: true, deliverAs: "followUp" });
-    if (forceAction) void pi.sendUserMessage(content, { deliverAs: "followUp" });
+    if (forceAction) {
+      rememberAutomaticUserNudge(dispatch, content);
+      void pi.sendUserMessage(content, { deliverAs: "followUp" });
+    }
   }
 
   async function queueContinuation(ctx: ExtensionContext, forceAction = false): Promise<void> {
@@ -1137,6 +1199,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function observeAutomaticDispatch(message: any, ctx: ExtensionContext, markStale = true): boolean {
     if (message?.role !== "custom" || message.customType !== GOAL_CONTINUATION) return false;
+    rememberAutomaticUserNudgeFromMessage(message);
     const dispatchId = message.details?.dispatchId;
     if (typeof dispatchId !== "string") {
       // Legacy continuations have no runtime-owned dispatch identity. History
@@ -1220,7 +1283,9 @@ export default function piGoal(pi: ExtensionAPI) {
     if (event.message?.role !== "user") return;
     const run = rt.activeRun;
     if (!run) return;
-    const staleAutomaticUserMessage = rt.staleAutomaticRun && !rt.userInputQueued;
+    const automaticUserNudge = consumeAutomaticUserNudge(event.message);
+    const currentAutomaticUserNudge = automaticUserNudge !== null && matchesCurrentContinuation(automaticUserNudge);
+    const staleAutomaticUserMessage = automaticUserNudge !== null && !currentAutomaticUserNudge;
     const stillOwned = run.goalId !== null
       && rt.goal?.status === "active"
       && run.goalGeneration === rt.goalGeneration
@@ -1235,8 +1300,11 @@ export default function piGoal(pi: ExtensionAPI) {
       run.automaticDispatchId = undefined;
       run.staleSynthetic = false;
     }
-    if (run.goalId === null && !run.userCandidate && !staleAutomaticUserMessage && rt.goal?.status === "active") bindActiveRunToGoal(rt.goal, true, ctx);
-    run.userOwned = true;
+    if (run.goalId === null && !run.userCandidate && !staleAutomaticUserMessage && rt.goal?.status === "active") {
+      if (currentAutomaticUserNudge) run.automaticDispatchId = automaticUserNudge.dispatchId;
+      bindActiveRunToGoal(rt.goal, !currentAutomaticUserNudge, ctx);
+    }
+    run.userOwned ||= !currentAutomaticUserNudge;
     run.userMessageSeen = true;
     run.staleSynthetic = (run.staleSynthetic && run.goalId !== null) || staleAutomaticUserMessage;
     run.staleAutomaticUserMessage = staleAutomaticUserMessage;

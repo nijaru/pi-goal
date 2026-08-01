@@ -1060,6 +1060,68 @@ describe("pi-goal extension", () => {
     expect(ctx.abort).not.toHaveBeenCalled();
   });
 
+  test("force-action user nudges retain automatic ownership when delivered separately", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "separate force action", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const firstQueued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstQueued } }, ctx);
+    const textOnly = assistant(0.1);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
+    expect(typeof nudge).toBe("string");
+
+    // The custom lifecycle marker may settle before the paired user nudge is
+    // delivered. The nudge must still be recognized as automatic work.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    const secondTextOnly = assistant(0.1);
+    await endTurn(pi, ctx, secondTextOnly, 0);
+    await endRun(pi, ctx, [secondTextOnly]);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+  });
+
+  test("unrelated extension user messages do not inherit stale nudge fencing", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "unrelated extension message", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const firstQueued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstQueued } }, ctx);
+    const textOnly = assistant(0.1);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+    const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
+    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
+    await pi.getCommand("goal").handler("clear", ctx);
+    ctx.abort.mockClear();
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "another extension follow-up" }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+
+    expect(ctx.abort).not.toHaveBeenCalled();
+    expect(nudge).toContain("previous automatic turn returned prose");
+  });
+
   test("stale force-action user nudges are fenced after clear", async () => {
     const pi = createMockAPI();
     extension(pi as any);
