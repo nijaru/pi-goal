@@ -70,6 +70,6 @@ any goal state → cleared (/goal clear or replacement)
 
 ## Persistence
 
-The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs and follow-ups are hidden, attributed custom messages; they never fabricate a visible user prompt.
+The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs and normal follow-ups are hidden, attributed custom messages. When an automatic turn returns prose without tool activity, pi-goal also queues a paired, lifecycle-fenced user-role follow-up so the next turn receives an actionable prompt; this is an extension-API workaround, not simulated user input.
 
 MIT
