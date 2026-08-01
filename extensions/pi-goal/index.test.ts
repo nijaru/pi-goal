@@ -1000,6 +1000,32 @@ describe("pi-goal extension", () => {
 
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
+  });
+
+  test("preserves the forced-action continuation when delivery is deferred", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "deferred forced action", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    const textOnly = assistant(0.1);
+    ctx.hasPendingMessages.mockReturnValue(true);
+    await endTurn(pi, ctx, textOnly, 0);
+    await endRun(pi, ctx, [textOnly]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    ctx.hasPendingMessages.mockReturnValue(false);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
   });
 
   test("automatic retries stay alive after a text-only response", async () => {

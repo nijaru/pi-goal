@@ -161,7 +161,7 @@ interface Runtime {
   goalGeneration: number;
   kickoff: ContinuationRequest | null;
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
-  pendingContinuation: ContinuationRequest | null;
+  pendingContinuation: { token: ContinuationRequest; forceAction: boolean } | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
   automaticRun: AutomaticDispatch | null;
   staleAutomaticRun: boolean;
@@ -558,11 +558,14 @@ function recentSummary(goal: GoalState, count = 3): string {
   }).join("\n");
 }
 
-function buildContinuationPrompt(goal: GoalState): string {
+function buildContinuationPrompt(goal: GoalState, forceAction = false): string {
   const recent = recentSummary(goal);
   const ideas = goal.ideas.length > 0 ? dataBlock("IDEAS", goal.ideas.slice(-10).map(idea => `- ${truncate(idea, 300)}`).join("\n"), 5_000) : "";
+  const actionInstruction = forceAction
+    ? "The previous automatic turn returned prose without using a tool, so it made no progress. Treat that response as failed: do not repeat a status update or say that you will continue. Use at least one available tool now to inspect, verify, or change the workspace and complete one concrete step. If the goal seems complete, prove that with a read-only check and log the evidence instead of claiming completion."
+    : "Continue the active goal. Make one concrete, evidence-backed step; do not merely report progress.";
   return [
-    "Continue the active goal. Make one concrete, evidence-backed step; do not merely report progress.",
+    actionInstruction,
     dataBlock("GOAL OBJECTIVE", goal.objective, MAX_OBJECTIVE),
     `Usage: ${formatUsage(goal)} · revision ${goal.revision}`,
     recent ? dataBlock("RECENT ATTEMPTS", recent, 5_000) : "",
@@ -856,7 +859,7 @@ export default function piGoal(pi: ExtensionAPI) {
     });
   }
 
-  function sendContinuation(goal: GoalState): void {
+  function sendContinuation(goal: GoalState, forceAction = false): void {
     const token = currentContinuation(goal);
     if (hasAutomaticDispatch(token)) {
       rt.pendingContinuation = null;
@@ -870,18 +873,18 @@ export default function piGoal(pi: ExtensionAPI) {
     // they cannot race a normal user prompt's preflight or appear as user work.
     pi.sendMessage({
       customType: GOAL_CONTINUATION,
-      content: buildContinuationPrompt(goal),
+      content: buildContinuationPrompt(goal, forceAction),
       display: false,
       details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId },
     }, { triggerTurn: true, deliverAs: "followUp" });
   }
 
-  async function queueContinuation(ctx: ExtensionContext): Promise<void> {
+  async function queueContinuation(ctx: ExtensionContext, forceAction = false): Promise<void> {
     await mutate(() => {
       if (!rt.goal || rt.goal.status !== "active") return;
       const goal = rt.goal;
       const token = currentContinuation(goal);
-      rt.pendingContinuation = token;
+      rt.pendingContinuation = { token, forceAction };
       if (markLimitIfNeeded(goal)) {
         rt.pendingContinuation = null;
         persistPatch(pi, goal);
@@ -892,20 +895,20 @@ export default function piGoal(pi: ExtensionAPI) {
       // Dropping it here leaves an active goal with no future wake-up.
       if (ctx.hasPendingMessages()) return;
       if (rt.kickoff?.goalId === goal.id && rt.kickoff.activationEpoch === rt.activationEpoch) rt.kickoff = null;
-      sendContinuation(goal);
+      sendContinuation(goal, forceAction);
     });
   }
 
   function drainPendingContinuation(ctx: ExtensionContext): void {
-    const token = rt.pendingContinuation;
-    if (!token) return;
-    if (!matchesCurrentContinuation(token)) {
+    const pending = rt.pendingContinuation;
+    if (!pending) return;
+    if (!matchesCurrentContinuation(pending.token)) {
       rt.pendingContinuation = null;
       return;
     }
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
     rt.pendingContinuation = null;
-    sendContinuation(rt.goal!);
+    sendContinuation(rt.goal!, pending.forceAction);
   }
 
   function startUserContinuation(ctx: ExtensionContext): void {
@@ -1401,6 +1404,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
   pi.on("agent_end", async (event: AgentEndEvent, ctx) => {
     let continuationToken: ContinuationRequest | null = null;
+    let forceAction = false;
     await mutate(() => {
       const run = rt.activeRun;
       rt.automaticRun = null;
@@ -1481,9 +1485,12 @@ export default function piGoal(pi: ExtensionAPI) {
       // hand off after tool activity (or a retry-created goal) so an ordinary
       // user reply does not unexpectedly recurse.
       const automaticGoalTurn = run.automaticDispatchId !== undefined || (!run.userOwned && run.goalId !== null);
-      if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) continuationToken = currentContinuation(goal);
+      if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) {
+        continuationToken = currentContinuation(goal);
+        forceAction = automaticGoalTurn && !run.hadToolActivity;
+      }
     });
-    if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx);
+    if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx, forceAction);
   });
 
   pi.on("agent_settled", (_event, ctx) => {
