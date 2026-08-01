@@ -136,6 +136,11 @@ interface AutomaticUserNudge extends AutomaticDispatch {
   content: string;
 }
 
+interface PendingAutomaticUserNudge {
+  dispatch: AutomaticDispatch;
+  content: string;
+}
+
 interface ActiveRun {
   goalId: string | null;
   goalGeneration: number;
@@ -168,6 +173,7 @@ interface Runtime {
   kickoff: ContinuationRequest | null;
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
   pendingContinuation: { token: ContinuationRequest; forceAction: boolean } | null;
+  pendingAutomaticUserNudge: PendingAutomaticUserNudge | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
   automaticUserNudges: Map<string, AutomaticUserNudge>;
   automaticRun: AutomaticDispatch | null;
@@ -721,6 +727,7 @@ export default function piGoal(pi: ExtensionAPI) {
     kickoff: null,
     pendingUserRun: null,
     pendingContinuation: null,
+    pendingAutomaticUserNudge: null,
     automaticDispatches: new Map(),
     automaticUserNudges: new Map(),
     automaticRun: null,
@@ -746,6 +753,7 @@ export default function piGoal(pi: ExtensionAPI) {
     if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.createdGoalId !== undefined || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
     rt.kickoff = null;
     rt.pendingContinuation = null;
+    rt.pendingAutomaticUserNudge = null;
     // Dispatch identities belong to the fenced activation. Stale delivered
     // messages are still rejected by their embedded generation token, so the
     // map can be cleared here without losing the fence.
@@ -818,6 +826,17 @@ export default function piGoal(pi: ExtensionAPI) {
       return nudge;
     }
     return null;
+  }
+
+  function restoreAutomaticUserNudges(ctx: ExtensionContext): void {
+    // A force-action marker is persisted before its paired user message is
+    // started. Rebuild that identity after reload so the queued user message
+    // cannot be mistaken for a fresh interactive prompt in the replacement
+    // runtime.
+    for (const entry of ctx.sessionManager.getBranch() as any[]) {
+      if (entry?.type !== "custom_message" || entry.customType !== GOAL_CONTINUATION) continue;
+      rememberAutomaticUserNudgeFromMessage({ role: "custom", content: entry.content, details: entry.details });
+    }
   }
 
   function syncActiveTools(): void {
@@ -930,21 +949,54 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.automaticDispatches.set(dispatch.dispatchId, dispatch);
     // Pi checks auto-compaction before draining follow-ups queued from
     // agent_end. Keep the custom dispatch marker hidden so lifecycle fencing
-    // can identify stale work. When a prior automatic turn returned only
-    // prose, also queue the same instruction as an actual user message: the
-    // model must receive a fresh actionable prompt rather than treating the
-    // hidden continuation as a status update.
+    // can identify stale work. A prose-only automatic turn needs a real user
+    // message, but queuing both messages as follow-ups would make Pi deliver
+    // the custom marker in a separate no-op provider turn when follow-up mode
+    // is one-at-a-time (the default). Defer that pair until the current run
+    // settles, append the hidden marker while idle, and then start exactly one
+    // user-owned-by-the-extension turn containing both entries.
     const content = buildContinuationPrompt(goal, forceAction);
+    if (forceAction) {
+      rememberAutomaticUserNudge(dispatch, content);
+      rt.pendingAutomaticUserNudge = { dispatch, content };
+      return;
+    }
     pi.sendMessage({
       customType: GOAL_CONTINUATION,
       content,
       display: false,
       details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId, forceAction },
     }, { triggerTurn: true, deliverAs: "followUp" });
-    if (forceAction) {
-      rememberAutomaticUserNudge(dispatch, content);
-      void pi.sendUserMessage(content, { deliverAs: "followUp" });
+  }
+
+  function drainPendingAutomaticUserNudge(ctx: ExtensionContext): boolean {
+    const pending = rt.pendingAutomaticUserNudge;
+    if (!pending) return false;
+    if (!matchesCurrentContinuation(pending.dispatch)) {
+      rt.pendingAutomaticUserNudge = null;
+      rt.automaticDispatches.delete(pending.dispatch.dispatchId);
+      rt.automaticUserNudges.delete(pending.dispatch.dispatchId);
+      return false;
     }
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) return false;
+    rt.pendingAutomaticUserNudge = null;
+    // At this idle boundary sendMessage appends the marker without starting a
+    // turn. sendUserMessage then starts one normal prompt, so the marker and
+    // actionable nudge cannot consume two provider turns.
+    pi.sendMessage({
+      customType: GOAL_CONTINUATION,
+      content: pending.content,
+      display: false,
+      details: {
+        goalId: pending.dispatch.goalId,
+        activationId: pending.dispatch.activationId,
+        activationEpoch: pending.dispatch.activationEpoch,
+        dispatchId: pending.dispatch.dispatchId,
+        forceAction: true,
+      },
+    });
+    void pi.sendUserMessage(pending.content);
+    return true;
   }
 
   async function queueContinuation(ctx: ExtensionContext, forceAction = false): Promise<void> {
@@ -977,6 +1029,7 @@ export default function piGoal(pi: ExtensionAPI) {
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
     rt.pendingContinuation = null;
     sendContinuation(rt.goal!, pending.forceAction);
+    if (pending.forceAction) drainPendingAutomaticUserNudge(ctx);
   }
 
   function startUserContinuation(ctx: ExtensionContext): void {
@@ -1109,6 +1162,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
     const reloadFence = readReloadFence(ctx);
     reconstruct(ctx, true, event.reason === "fork");
+    restoreAutomaticUserNudges(ctx);
     if (reloadFence) {
       if (event.reason === "reload" && !ctx.isIdle()) {
         // Do not abort here: after replacement there is no ownership evidence
@@ -1572,19 +1626,18 @@ export default function piGoal(pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     rt.settlementOwner = null;
+    rt.retryOwner = null;
+    rt.retryCreatedGoal = null;
+    if (drainPendingAutomaticUserNudge(ctx)) return;
     const kickoff = rt.kickoff;
     if (!kickoff) {
       // Keep a dispatch registered until message_start consumes it. A
       // continuation queued by agent_end may be delivered just after the
       // settlement callback; clearing it here loses goal ownership and can
       // turn the next provider request into an unowned or aborted run.
-      rt.retryOwner = null;
-      rt.retryCreatedGoal = null;
       drainPendingContinuation(ctx);
       return;
     }
-    rt.retryOwner = null;
-    rt.retryCreatedGoal = null;
     const goal = rt.goal;
     if (!goal || goal.status !== "active" || !matchesCurrentContinuation(kickoff)) {
       rt.kickoff = null;
