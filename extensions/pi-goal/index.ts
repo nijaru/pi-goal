@@ -575,7 +575,7 @@ function buildContinuationPrompt(goal: GoalState, forceAction = false): string {
   const recent = recentSummary(goal);
   const ideas = goal.ideas.length > 0 ? dataBlock("IDEAS", goal.ideas.slice(-10).map(idea => `- ${truncate(idea, 300)}`).join("\n"), 5_000) : "";
   const actionInstruction = forceAction
-    ? "The previous automatic turn returned prose without using a tool, so it made no progress. Treat that response as failed: do not repeat a status update or say that you will continue. Use at least one available tool now to inspect, verify, or change the workspace and complete one concrete step. If the goal seems complete, prove that with a read-only check and log the evidence instead of claiming completion."
+    ? "The previous goal-owned provider turn returned prose without using a tool, so it did not produce the next concrete step. Treat that response as failed: do not repeat a status update or say that you will continue. Use at least one available tool now to inspect, verify, or change the workspace and complete one concrete step. If the goal seems complete, prove that with a read-only check and log the evidence instead of claiming completion."
     : "Continue the active goal. Make one concrete, evidence-backed step; do not merely report progress.";
   return [
     actionInstruction,
@@ -1187,6 +1187,7 @@ export default function piGoal(pi: ExtensionAPI) {
     // reach the selected branch or be charged to its reconstructed goal.
     if (!ctx.isIdle()) ctx.abort();
     reconstruct(ctx, false, false, true, true);
+    restoreAutomaticUserNudges(ctx);
     if (rt.activeRun) rt.activeRun.discardUsage = true;
     invalidateRestoredEvaluation(ctx);
     const settlementOwner = rt.settlementOwner;

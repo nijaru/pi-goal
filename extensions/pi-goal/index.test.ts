@@ -329,6 +329,28 @@ describe("pi-goal extension", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  test("tree reconstruction restores force-action identity before a queued user message", async () => {
+    const source = createMockAPI();
+    extension(source as any);
+    const sourceCtx: any = createMockCtx(source.entries);
+    const result = await source.getTool("create_goal").execute("1", { objective: "tree nudge", budget: 5 }, undefined, undefined, sourceCtx);
+    source.entries.push({
+      type: "custom_message",
+      customType: "pi-goal/continuation",
+      content: "tree force action",
+      details: { goalId: result.details.goal.id, activationId: "old-activation", activationEpoch: 4, dispatchId: "old-dispatch", forceAction: true },
+    });
+
+    const pi = createMockAPI(source.entries);
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.handlers.get("session_tree")({ type: "session_tree", newLeafId: "leaf", oldLeafId: null }, ctx);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "tree force action" }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalled();
+  });
+
   test("tree navigation fences a streaming goal run before reconstruction", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -985,6 +1007,23 @@ describe("pi-goal extension", () => {
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.usage.turns).toBe(0);
   });
 
+  test("tool-created goals continue after a tool-then-summary turn", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await startRun(pi, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "continue after summary", budget: 5 }, undefined, undefined, ctx);
+    const toolCall = assistant(0.1, 10, 5, 15, true);
+    await endTurn(pi, ctx, toolCall, 0);
+    const summary = assistant(0.1);
+    await endTurn(pi, ctx, summary, 1);
+    await endRun(pi, ctx, [toolCall, summary]);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   test("retains continuation ownership when settlement precedes delivery", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -1030,7 +1069,7 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
-    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
+    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous goal-owned provider turn returned prose without using a tool");
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendUserMessage.mock.calls[0]?.[0]).toBe(pi.sendMessage.mock.calls[1]?.[0].content);
     expect(pi.sendUserMessage.mock.calls[0]?.[1]).toBeUndefined();
@@ -1058,7 +1097,7 @@ describe("pi-goal extension", () => {
     ctx.hasPendingMessages.mockReturnValue(false);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous automatic turn returned prose without using a tool");
+    expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous goal-owned provider turn returned prose without using a tool");
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendUserMessage.mock.calls[0]?.[1]).toBeUndefined();
   });
@@ -1157,7 +1196,7 @@ describe("pi-goal extension", () => {
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
 
     expect(ctx.abort).not.toHaveBeenCalled();
-    expect(nudge).toContain("previous automatic turn returned prose");
+    expect(nudge).toContain("previous goal-owned provider turn returned prose");
   });
 
   test("stale force-action user nudges are fenced after clear", async () => {
