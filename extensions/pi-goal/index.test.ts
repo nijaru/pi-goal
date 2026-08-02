@@ -124,7 +124,8 @@ describe("pi-goal extension", () => {
     }
     await expect(pi.getTool("update_goal").execute("2", { status: "paused" }, undefined, undefined, ctx)).rejects.toThrow("only accepts complete or blocked");
     await expect(pi.getTool("update_goal").execute("3", { status: "blocked", budget: 99 }, undefined, undefined, ctx)).rejects.toThrow("blocker");
-    await pi.getTool("update_goal").execute("4", { status: "blocked", blocker: "waiting" }, undefined, undefined, ctx);
+    const blocked = await pi.getTool("update_goal").execute("4", { status: "blocked", blocker: "waiting" }, undefined, undefined, ctx);
+    expect(blocked.terminate).toBe(true);
     expect(pi.activeTools).toEqual(new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "create_goal"]));
   });
 
@@ -1521,6 +1522,7 @@ describe("pi-goal extension", () => {
     await evaluate.execute("10", { verdict: "achieved", reason: "verified after bash", evidence: "clean" }, undefined, undefined, ctx);
     const done = await update.execute("11", { status: "complete" }, undefined, undefined, ctx);
     expect(done.details.goal.status).toBe("complete");
+    expect(done.terminate).toBe(true);
   });
 
   test("does not exempt parallel or token-smuggling subagent calls from evaluation invalidation", async () => {

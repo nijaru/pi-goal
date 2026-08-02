@@ -1895,6 +1895,9 @@ export default function piGoal(pi: ExtensionAPI) {
       return mutate(() => {
         requireActive(rt.goal);
         const goal = rt.goal!;
+        // End terminal updates at the tool boundary. The activation fence still
+        // protects stale queued work, while terminate avoids an extra provider
+        // request that would otherwise be aborted after completion.
         if (params.status === "complete") {
           if (goal.lastEvaluation?.verdict !== "achieved" || goal.lastEvaluation.revision !== goal.revision || !goal.lastEvaluation.evidence?.trim()) {
             throw new Error("Completion requires evaluate_goal to record achieved with non-empty evidence for the current revision.");
@@ -1906,7 +1909,7 @@ export default function piGoal(pi: ExtensionAPI) {
           syncActiveTools();
           persistPatch(pi, goal);
           updateWidget(ctx);
-          return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}\nUsage: ${formatUsage(goal)}` }], details: { goal: goalDetails(goal) } };
+          return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}\nUsage: ${formatUsage(goal)}` }], details: { goal: goalDetails(goal) }, terminate: true };
         }
 
         if (params.status !== "blocked") throw new Error("Model-facing update_goal only accepts complete or blocked; use /goal for pause, resume, clear, or limit changes.");
@@ -1920,7 +1923,7 @@ export default function piGoal(pi: ExtensionAPI) {
         syncActiveTools();
         persistPatch(pi, goal);
         updateWidget(ctx);
-        return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${goal.blocker}` }], details: { goal: goalDetails(goal) } };
+        return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${goal.blocker}` }], details: { goal: goalDetails(goal) }, terminate: true };
       });
     },
     renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("update_goal ")) + theme.fg(args.status === "complete" ? "success" : "accent", args.status), 0, 0); },
