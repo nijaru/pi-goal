@@ -617,6 +617,35 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  test("terminating compact handoffs defer recovery to the compaction extension", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "compact handoff", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+
+    pi.handlers.get("tool_execution_end")({
+      type: "tool_execution_end",
+      toolCallId: "compact-1",
+      toolName: "compact",
+      result: { content: [{ type: "text", text: "Compaction started." }], terminate: true },
+      isError: false,
+    }, ctx);
+    const message = assistant(0, 10, 5, 15, true);
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message, toolResults: [] }, ctx);
+    await endRun(pi, ctx, [message]);
+
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+
+    // The companion compactor supplies the post-compaction user prompt. It
+    // must be able to bind that extension-originated message to the goal.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "Continue." }] } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
   test("invalid lifecycle commands do not abort unrelated work", async () => {
     const pi = createMockAPI();
     extension(pi as any);

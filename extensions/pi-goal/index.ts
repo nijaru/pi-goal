@@ -17,6 +17,7 @@ import type {
   SessionCompactEvent,
   SessionTreeEvent,
   ToolCallEvent,
+  ToolExecutionEndEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -157,6 +158,7 @@ interface ActiveRun {
   createdGoalEpoch?: number;
   createdGoalRetry: boolean;
   retryRun: boolean;
+  compactionHandoff: boolean;
   turnsSeen: Set<number>;
   hadToolActivity: boolean;
 }
@@ -1461,6 +1463,7 @@ export default function piGoal(pi: ExtensionAPI) {
       ...(retryCreatedOwnsRun ? { createdGoalId: goal.id, createdGoalEpoch: rt.activationEpoch } : {}),
       createdGoalRetry: retryCreatedOwnsRun,
       retryRun: retryOwnsRun || retryCreatedOwnsRun,
+      compactionHandoff: false,
       turnsSeen: new Set(),
       hadToolActivity: false,
     };
@@ -1591,6 +1594,17 @@ export default function piGoal(pi: ExtensionAPI) {
         // An unrelated run can still trigger Pi compaction before settlement;
         // never charge that auxiliary request to a goal activated meanwhile.
         rt.settlementOwner = { goalId: null, goalGeneration: rt.goalGeneration, activationEpoch: rt.activationEpoch };
+      }
+      if (run.compactionHandoff) {
+        // The compaction extension sends the recovery prompt only after Pi is
+        // idle. Do not queue a normal goal continuation into the run that
+        // compact() is about to disconnect and abort.
+        if (goal && (createdGoalOwnsRun || currentRunOwnsGoal)) {
+          goal.updatedAt = now();
+          persistPatch(pi, goal);
+          updateWidget(ctx);
+        }
+        return;
       }
       if (!run.goalId) {
         if (createdGoalOwnsRun && failed && !interrupted) {
@@ -1757,6 +1771,21 @@ export default function piGoal(pi: ExtensionAPI) {
       persistPatch(pi, goal);
       updateWidget(ctx);
     });
+  });
+
+  pi.on("tool_execution_end", (event: ToolExecutionEndEvent, _ctx) => {
+    if (event.toolName !== "compact" || event.isError || event.result?.terminate !== true) return;
+    const run = rt.activeRun;
+    const goal = rt.goal;
+    if (!run || !goal || goal.status !== "active") return;
+    const ownsGoal = (run.goalId === goal.id && run.goalGeneration === rt.goalGeneration && run.activationEpoch === rt.activationEpoch)
+      || (run.createdGoalId === goal.id && run.createdGoalEpoch === rt.activationEpoch)
+      || (run.automaticDispatchId !== undefined && run.goalId === goal.id);
+    if (!ownsGoal) return;
+    // pi-compactor owns the post-compaction wake-up. A normal continuation
+    // queued from agent_end can race the deferred compact() call, be lost when
+    // Pi rebuilds the context, or leave a second provider run behind it.
+    run.compactionHandoff = true;
   });
 
   pi.on("session_before_compact", (_event, _ctx) => {
