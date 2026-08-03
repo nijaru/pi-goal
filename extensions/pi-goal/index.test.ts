@@ -1014,6 +1014,59 @@ describe("pi-goal extension", () => {
     expect(state.details.goal.usage.totalTokens).toBe(45);
   });
 
+  test("accounts blocking pi-workflows tokenUsage returned in tool details", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "blocking workflow usage", budget: 0.25 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0.1);
+    await pi.handlers.get("turn_end")({
+      type: "turn_end",
+      turnIndex: 0,
+      message,
+      toolResults: [{
+        toolName: "workflow",
+        details: {
+          tokenUsage: { input: 20, output: 10, total: 30, cost: 0.2 },
+        },
+      }],
+    }, ctx);
+    const state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.status).toBe("budget_limited");
+    expect(state.details.goal.usage.turns).toBe(1);
+    expect(state.details.goal.usage.cost).toBeCloseTo(0.3);
+    expect(state.details.goal.usage.inputTokens).toBe(30);
+    expect(state.details.goal.usage.outputTokens).toBe(15);
+    expect(state.details.goal.usage.totalTokens).toBe(45);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("accounts failed blocking pi-workflows usage markers", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "failed workflow usage", budget: 0.25 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const message = assistant(0.1);
+    await pi.handlers.get("turn_end")({
+      type: "turn_end",
+      turnIndex: 0,
+      message,
+      toolResults: [{
+        toolName: "workflow",
+        isError: true,
+        content: [{ type: "text", text: 'Workflow failed\n__pi_workflows_usage__:{"input":20,"output":10,"total":30,"cost":0.2}' }],
+        details: {},
+      }],
+    }, ctx);
+    const state = await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(state.details.goal.status).toBe("budget_limited");
+    expect(state.details.goal.usage.cost).toBeCloseTo(0.3);
+    expect(state.details.goal.usage.totalTokens).toBe(45);
+    expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
   test("stops a compaction-limited goal instead of treating its follow-up as user work", async () => {
     const pi = createMockAPI();
     extension(pi as any);

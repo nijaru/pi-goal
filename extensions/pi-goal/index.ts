@@ -40,6 +40,10 @@ const MAX_ITERATIONS = 500;
 const MAX_IDEAS = 100;
 const MAX_AUTOMATIC_USER_NUDGES = 64;
 const GOAL_PROGRESS_TOOLS = ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"] as const;
+// pi-workflows cannot attach details when its tool execute() throws. Its
+// blocking error path appends this bounded JSON marker so goal accounting can
+// still charge child usage on failed/cancelled workflow calls.
+const WORKFLOW_USAGE_PREFIX = "__pi_workflows_usage__:";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -668,7 +672,11 @@ function providerUsage(usage: unknown): ProviderUsage {
   if (!isRecord(usage)) return { input: 0, output: 0, total: 0, cost: 0 };
   const input = isNonNegativeNumber(usage.input) ? usage.input : 0;
   const output = isNonNegativeNumber(usage.output) ? usage.output : 0;
-  const total = isNonNegativeNumber(usage.totalTokens) ? usage.totalTokens : boundedAdd(input, output);
+  const total = isNonNegativeNumber(usage.totalTokens)
+    ? usage.totalTokens
+    : isNonNegativeNumber(usage.total)
+      ? usage.total
+      : boundedAdd(input, output);
   const cost = isRecord(usage.cost)
     ? (isNonNegativeNumber(usage.cost.total) ? usage.cost.total : 0)
     : (isNonNegativeNumber(usage.cost) ? usage.cost : 0);
@@ -684,16 +692,45 @@ function addProviderUsage(left: ProviderUsage, right: ProviderUsage): ProviderUs
   };
 }
 
+function workflowErrorUsage(toolResult: unknown): ProviderUsage | undefined {
+  if (!isRecord(toolResult) || toolResult.toolName !== "workflow" || toolResult.isError !== true || !Array.isArray(toolResult.content)) return undefined;
+  const text = toolResult.content
+    .filter((part): part is Record<string, unknown> => isRecord(part) && part.type === "text" && typeof part.text === "string")
+    .map(part => part.text as string)
+    .join("");
+  const marker = text.lastIndexOf(WORKFLOW_USAGE_PREFIX);
+  if (marker < 0) return undefined;
+  const encoded = text.slice(marker + WORKFLOW_USAGE_PREFIX.length).trim();
+  if (encoded.length > 4096) return undefined;
+  try {
+    const parsed = JSON.parse(encoded);
+    return isRecord(parsed) ? providerUsage(parsed) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function toolResultUsage(toolResult: unknown): ProviderUsage {
   if (!isRecord(toolResult)) return { input: 0, output: 0, total: 0, cost: 0 };
   // ToolResultMessage.usage is the canonical location when a tool exposes it.
   if (toolResult.usage !== undefined) return providerUsage(toolResult.usage);
 
+  const workflowFailureUsage = workflowErrorUsage(toolResult);
+  if (workflowFailureUsage) return workflowFailureUsage;
+
+  const details = toolResult.details;
+  if (!isRecord(details)) return { input: 0, output: 0, total: 0, cost: 0 };
+
+  // A blocking pi-workflows result returns WorkflowRunResult in tool details.
+  // Its child-session usage is exposed as details.tokenUsage rather than the
+  // provider-shaped totalTokens field used by Pi. Count it once at turn_end;
+  // detached workflows are blocked while a goal is active by tool_call.
+  if (details.tokenUsage !== undefined) return providerUsage(details.tokenUsage);
+
   // pi-subagents reports child model usage in details.results[*].usage rather
   // than ToolResultMessage.usage. Aggregate that shape without counting a
   // duplicate top-level value.
-  const details = toolResult.details;
-  if (!isRecord(details) || !Array.isArray(details.results)) return { input: 0, output: 0, total: 0, cost: 0 };
+  if (!Array.isArray(details.results)) return { input: 0, output: 0, total: 0, cost: 0 };
   return details.results.reduce<ProviderUsage>((total, result) => {
     if (!isRecord(result)) return total;
     return addProviderUsage(total, providerUsage(result.usage));
