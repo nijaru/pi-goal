@@ -1497,10 +1497,13 @@ export default function piGoal(pi: ExtensionAPI) {
     if (!staleAutomaticUserMessage) {
       // A steer/follow-up can be delivered inside the existing agent run, so
       // Pi does not emit another agent_start to clear the admission marker.
-      // Consume it at the message boundary or later continuation gates can
-      // remain blocked forever.
-      rt.userInputQueued = false;
-      rt.pendingUserRun = null;
+      // Consume it at the real user-message boundary or later continuation
+      // gates can remain blocked forever. The paired automatic nudge is not
+      // that boundary; keep the marker until the user's message arrives.
+      if (!currentAutomaticUserNudge) {
+        rt.userInputQueued = false;
+        rt.pendingUserRun = null;
+      }
       rt.staleAutomaticRun = false;
     }
   });
