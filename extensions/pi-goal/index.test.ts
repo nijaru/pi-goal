@@ -671,6 +671,16 @@ describe("pi-goal extension", () => {
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "Continue." }] } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
+
+    // Recovery is an automatic goal turn even though pi-compactor delivers it
+    // as a user-role message. A prose-only response must receive the same
+    // actionable follow-up as any other automatic turn.
+    const recovery = assistant(0.1);
+    await endTurn(pi, ctx, recovery, 0);
+    await endRun(pi, ctx, [recovery]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   test("invalid lifecycle commands do not abort unrelated work", async () => {
@@ -1807,6 +1817,113 @@ describe("pi-goal extension", () => {
     expect(blocked).toEqual({ block: true });
     const allowed = await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "w-2", toolName: "workflow", input: { background: false } }, ctx);
     expect(allowed).toBeUndefined();
+  });
+
+  test("blocked workflows do not count as automatic progress", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "bound blocked workflows", budget: 5 }, undefined, undefined, ctx);
+
+    // Establish the first automatic continuation with real tool activity.
+    await startRun(pi, ctx);
+    await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "read-1", toolName: "read", input: {} }, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    let continuation = pi.sendMessage.mock.calls[0]?.[0];
+    let nudge: string | undefined;
+
+    for (let turn = 0; turn < 3; turn++) {
+      pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+      pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
+      if (nudge !== undefined) {
+        pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+      }
+      const blocked = await pi.handlers.get("tool_call")({
+        type: "tool_call",
+        toolCallId: `blocked-${turn}`,
+        toolName: "workflow",
+        input: { background: true },
+      }, ctx);
+      expect(blocked).toEqual({ block: true });
+      const prose = assistant(0.1);
+      await endTurn(pi, ctx, prose, 0);
+      await endRun(pi, ctx, [prose]);
+      if (turn < 2) {
+        pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+        continuation = pi.sendMessage.mock.calls.at(-1)?.[0];
+        nudge = pi.sendUserMessage.mock.calls.at(-1)?.[0];
+      }
+    }
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("no-progress");
+  });
+
+  test("blocks and releases a nudge when delivery fails", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "failed nudge", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const continuation = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
+    const prose = assistant(0.1);
+    await endTurn(pi, ctx, prose, 0);
+    await endRun(pi, ctx, [prose]);
+
+    pi.sendUserMessage.mockImplementationOnce(() => Promise.reject(new Error("provider preflight failed")));
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    await flushTimers();
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toBe("automatic continuation delivery failed");
+    expect(state.blocker).toContain("provider preflight failed");
+
+    // The failed dispatch is no longer able to suppress a user-requested
+    // resume after the provider is fixed.
+    await pi.getCommand("goal").handler("resume", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+  });
+
+  test("a real user prompt releases an attempted nudge reservation", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "user recovers nudge", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const continuation = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
+    const prose = assistant(0.1);
+    await endTurn(pi, ctx, prose, 0);
+    await endRun(pi, ctx, [prose]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // The mock does not start a provider run. A real user prompt must still
+    // release the attempted dispatch so its tool work can queue a continuation.
+    await startRun(pi, ctx);
+    await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "read-recovery", toolName: "read", input: {} }, ctx);
+    const userWork = assistant(0.1, 10, 5, 15, true);
+    await endTurn(pi, ctx, userWork, 0);
+    await endRun(pi, ctx, [userWork]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
   });
 
   test("does not spin after a prose-only lifecycle", async () => {
