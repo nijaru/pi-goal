@@ -994,7 +994,7 @@ export default function piGoal(pi: ExtensionAPI) {
     // Preserve a queued user prompt, especially in RPC mode where aborting can
     // consume it. The next provider turn is allowed to run as normal work, but
     // no longer counts toward the limited goal.
-    const userWorkQueued = rt.userInputQueued && ctx.hasPendingMessages();
+    const userWorkQueued = hasAdmittedUserWork(ctx);
     rt.userInputQueued = userWorkQueued;
     rt.stopNextAgentStart = !userWorkQueued;
     if (!userWorkQueued) ctx.abort();
@@ -1051,6 +1051,14 @@ export default function piGoal(pi: ExtensionAPI) {
     });
   }
 
+  function hasPendingUserWork(ctx: ExtensionContext): boolean {
+    return rt.userInputQueued || ctx.hasPendingMessages();
+  }
+
+  function hasAdmittedUserWork(ctx: ExtensionContext): boolean {
+    return rt.userInputQueued || (rt.pendingUserRun !== null && ctx.hasPendingMessages());
+  }
+
   function sendContinuation(goal: GoalState, forceAction = false): void {
     const token = currentContinuation(goal);
     if (hasAutomaticDispatch(token)) {
@@ -1091,7 +1099,7 @@ export default function piGoal(pi: ExtensionAPI) {
       rt.automaticUserNudges.delete(pending.dispatch.dispatchId);
       return false;
     }
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return false;
+    if (!ctx.isIdle() || hasPendingUserWork(ctx)) return false;
     rt.pendingAutomaticUserNudge = null;
     // At this idle boundary sendMessage appends the marker without starting a
     // turn. sendUserMessage then starts one normal prompt, so the marker and
@@ -1126,7 +1134,9 @@ export default function piGoal(pi: ExtensionAPI) {
       }
       // Keep the token until settlement if another prompt is already queued.
       // Dropping it here leaves an active goal with no future wake-up.
-      if (ctx.hasPendingMessages()) return;
+      // User input may be observed before Pi reports a pending message, so
+      // gate on both signals before launching synthetic work.
+      if (hasPendingUserWork(ctx)) return;
       if (rt.kickoff?.goalId === goal.id && rt.kickoff.activationEpoch === rt.activationEpoch) rt.kickoff = null;
       sendContinuation(goal, forceAction);
     });
@@ -1139,7 +1149,7 @@ export default function piGoal(pi: ExtensionAPI) {
       rt.pendingContinuation = null;
       return;
     }
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (!ctx.isIdle() || hasPendingUserWork(ctx)) return;
     rt.pendingContinuation = null;
     sendContinuation(rt.goal!, pending.forceAction);
     if (pending.forceAction) drainPendingAutomaticUserNudge(ctx);
@@ -1151,7 +1161,7 @@ export default function piGoal(pi: ExtensionAPI) {
     const token = currentContinuation(goal);
     if (hasAutomaticDispatch(token)) return;
     rt.kickoff = token;
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (!ctx.isIdle() || hasPendingUserWork(ctx)) return;
     rt.kickoff = null;
     sendContinuation(goal);
   }
@@ -1484,7 +1494,15 @@ export default function piGoal(pi: ExtensionAPI) {
     run.userMessageSeen = true;
     run.staleSynthetic = (run.staleSynthetic && run.goalId !== null) || staleAutomaticUserMessage;
     run.staleAutomaticUserMessage = staleAutomaticUserMessage;
-    if (!staleAutomaticUserMessage) rt.staleAutomaticRun = false;
+    if (!staleAutomaticUserMessage) {
+      // A steer/follow-up can be delivered inside the existing agent run, so
+      // Pi does not emit another agent_start to clear the admission marker.
+      // Consume it at the message boundary or later continuation gates can
+      // remain blocked forever.
+      rt.userInputQueued = false;
+      rt.pendingUserRun = null;
+      rt.staleAutomaticRun = false;
+    }
   });
   pi.on("agent_start", (_event: AgentStartEvent, ctx) => {
     syncActiveTools();
@@ -1820,7 +1838,7 @@ export default function piGoal(pi: ExtensionAPI) {
       rt.kickoff = null;
       return;
     }
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (!ctx.isIdle() || hasPendingUserWork(ctx)) return;
     rt.pendingContinuation = null;
     startUserContinuation(ctx);
     drainPendingContinuation(ctx);

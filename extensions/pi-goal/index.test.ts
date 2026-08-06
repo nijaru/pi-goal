@@ -766,6 +766,64 @@ describe("pi-goal extension", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  test("queued user input wins before the host reports pending messages", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "prioritize user input", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+
+    // The input lifecycle event can precede ctx.hasPendingMessages() while a
+    // user prompt is still being admitted. Do not launch synthetic work into
+    // that window; retain the continuation for after the user run settles.
+    pi.handlers.get("input")({ type: "input", text: "user takes priority", source: "interactive" }, ctx);
+    ctx.hasPendingMessages.mockReturnValue(false);
+    await endRun(pi, ctx, [first]);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "user takes priority" }] } }, ctx);
+    await endRun(pi, ctx, [assistant(0.1)]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+  });
+
+  test("a delivered user steer clears admission before continuation gates", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "consume user steer", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+
+    // A steer is delivered inside the existing agent run; no second
+    // agent_start event clears the input admission marker.
+    pi.handlers.get("input")({ type: "input", text: "steer now", source: "interactive", streamingBehavior: "steer" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "steer now" }] } }, ctx);
+    await endRun(pi, ctx, [first]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+  });
+
+  test("a limit preserves admitted user input before pending-message state updates", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "preserve limited user input", budget: 5, maxTurns: 1 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    pi.handlers.get("input")({ type: "input", text: "inspect the limit", source: "interactive" }, ctx);
+    ctx.hasPendingMessages.mockReturnValue(false);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    expect(ctx.abort).not.toHaveBeenCalled();
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("budget_limited");
+  });
+
   test("lifecycle commands do not wait through retry backoff", async () => {
     const pi = createMockAPI();
     extension(pi as any);
