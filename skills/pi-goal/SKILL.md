@@ -38,7 +38,7 @@ Pause, resume, clear, and budget/maxTurns changes are user-command-only.
 1. Use one objective with a measurable stopping condition and verification surface.
 2. Call `log_iteration` after meaningful attempts and include command/test output.
 3. Before completion, request `evaluate_goal` with no verdict. The caller must give its prompt to a genuinely fresh, read-only evaluator (the `subagent` handoff is supported while evaluation is pending), record that evaluator's verdict and non-empty evidence, then call `update_goal` with `complete` only if it says `achieved` for the current revision. Any other workspace-mutating tool activity invalidates the request; evaluator independence remains caller-enforced.
-4. Use `blocked` when user input or an external dependency is required; include the concrete blocker.
+4. Use `blocked` when user input or an external dependency is required; include the concrete blocker. Exhausted provider retries and three consecutive automatic turns without meaningful tool activity also block the loop; resume only after correcting the provider or choosing a new step.
 5. Usage is scoped to the goal active at `agent_start` and accounted once per `turn_end`. Omitted limits are unlimited. An explicit USD threshold is post-provider-call, so one call may overshoot; an explicit `maxTurns` aborts before another turn. Pi's local budget is optional policy, not a replacement for provider or ChatGPT-plan quotas.
 6. Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate a recorded evaluation. `evaluate_goal` followed by `update_goal complete` does not.
 7. While a goal is active, invoke pi-workflows only with `background: false`; detached/background workflows are blocked to prevent continuation races.
@@ -46,6 +46,6 @@ Pause, resume, clear, and budget/maxTurns changes are user-command-only.
 
 ## Lifecycle
 
-`active` → `complete` | `blocked` | `budget_limited` (only when an explicit limit is reached) | `paused` | `cleared`.
+`active` → `complete` | `blocked` | `budget_limited` (only when an explicit limit is reached) | `paused` | `cleared`; provider retry exhaustion and repeated no-progress turns use `blocked`.
 
 Goals are persisted as Pi session custom entries and reconstructed from the current branch. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstructs the selected state but does not schedule work before the selected prompt is resubmitted, and invalidates prior evaluation evidence. Compaction keeps Pi's normal summary. Kickoffs and normal continuations use hidden, attributed custom messages queued through Pi's retry and compaction-safe lifecycle. A terminating `compact` tool handoff is excluded from that normal continuation path; the compaction extension owns the recovery prompt after Pi reaches idle. If a goal-owned provider turn returns prose without tool activity, pi-goal waits for the current run to settle, appends its hidden lifecycle marker, and starts one paired, lifecycle-fenced user-role follow-up so the next turn receives an actionable prompt without a separate no-op provider turn; this is an extension-API workaround.

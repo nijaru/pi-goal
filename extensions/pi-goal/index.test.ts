@@ -382,6 +382,32 @@ describe("pi-goal extension", () => {
     await expect(update.execute("4", { status: "complete" }, undefined, undefined, ctx)).rejects.toThrow("Completion requires");
   });
 
+  test("tree summary usage belongs to the selected branch goal", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries, "session-a");
+    await pi.getTool("create_goal").execute("1", { objective: "tree usage", budget: 1 }, undefined, undefined, ctx);
+    const selectedBranch = [...pi.entries];
+    await startRun(pi, ctx);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+
+    // Navigating to an older branch replaces the runtime goal before the
+    // branch-summary usage is reported. That usage must not be charged to the
+    // abandoned run's in-memory settlement owner.
+    pi.entries.splice(0, pi.entries.length, ...selectedBranch);
+    await pi.handlers.get("session_tree")({
+      type: "session_tree",
+      newLeafId: "older-leaf",
+      oldLeafId: "current-leaf",
+      summaryEntry: { usage: providerUsage(0.5) },
+    }, ctx);
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.usage.cost).toBeCloseTo(0.5);
+    expect(state.usage.turns).toBe(0);
+  });
+
   test("reload fences a goal-owned run before replacing runtime ownership", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -1097,6 +1123,24 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  test("blocks a goal when provider retries finally fail", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "stop exhausted retries", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error", errorMessage: "provider unavailable" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.blocker).toContain("provider unavailable");
+    expect(state.stopReason).toContain("provider retries exhausted");
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
   test("does not charge a goal created after agent_start or resurrect a replaced goal", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -1292,6 +1336,49 @@ describe("pi-goal extension", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  test("blocks after repeated automatic no-progress turns", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "bound no progress", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const kickoff = pi.sendMessage.mock.calls[0]?.[0];
+
+    // The first automatic prose response gets one actionable nudge.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...kickoff } }, ctx);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const firstForce = pi.sendMessage.mock.calls[1]?.[0];
+    const firstNudge = pi.sendUserMessage.mock.calls[0]?.[0];
+
+    // Two more prose-only automatic turns must stop the loop instead of
+    // producing an unbounded stream of identical nudges.
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstForce } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: firstNudge }] } }, ctx);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const secondForce = pi.sendMessage.mock.calls[2]?.[0];
+    const secondNudge = pi.sendUserMessage.mock.calls[1]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...secondForce } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: secondNudge }] } }, ctx);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("no-progress");
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
@@ -1604,6 +1691,39 @@ describe("pi-goal extension", () => {
       input: { agent: "reviewer", task: "read-only evaluation", cwd: nextNonce },
     }, ctx);
     expect((await pi.getTool("get_goal").execute("7", {}, undefined, undefined, ctx)).details.goal.evaluationRequested).toBeUndefined();
+  });
+
+  test("fences sibling tool calls after a valid terminal update", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    const create = pi.getTool("create_goal");
+    const evaluate = pi.getTool("evaluate_goal");
+    const update = pi.getTool("update_goal");
+    await create.execute("1", { objective: "terminal sibling fence", budget: 5 }, undefined, undefined, ctx);
+    await evaluate.execute("2", {}, undefined, undefined, ctx);
+    await evaluate.execute("3", { verdict: "achieved", reason: "verified", evidence: "clean" }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+
+    const terminalCall = {
+      type: "tool_call",
+      toolCallId: "terminal-1",
+      toolName: "update_goal",
+      input: { status: "complete" },
+    };
+    expect(await pi.handlers.get("tool_call")(terminalCall, ctx)).toBeUndefined();
+    expect(await pi.handlers.get("tool_call")({
+      type: "tool_call",
+      toolCallId: "sibling-edit",
+      toolName: "edit",
+      input: { path: "after-complete.ts", edits: [] },
+    }, ctx)).toEqual({ block: true });
+
+    const done = await update.execute("terminal-1", { status: "complete" }, undefined, undefined, ctx);
+    expect(done.terminate).toBe(true);
+    expect((await pi.getTool("get_goal").execute("4", {}, undefined, undefined, ctx)).details.goal.status).toBe("complete");
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).toHaveBeenCalled();
   });
 
   test("escapes embedded data-block closing markers", async () => {

@@ -39,6 +39,7 @@ const MAX_EVIDENCE = 2_000;
 const MAX_ITERATIONS = 500;
 const MAX_IDEAS = 100;
 const MAX_AUTOMATIC_USER_NUDGES = 64;
+const MAX_STALLED_AUTOMATIC_TURNS = 3;
 const GOAL_PROGRESS_TOOLS = ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"] as const;
 // pi-workflows cannot attach details when its tool execute() throws. Its
 // blocking error path appends this bounded JSON marker so goal accounting can
@@ -165,6 +166,7 @@ interface ActiveRun {
   compactionHandoff: boolean;
   turnsSeen: Set<number>;
   hadToolActivity: boolean;
+  hadMeaningfulActivity: boolean;
 }
 
 interface Runtime {
@@ -186,8 +188,11 @@ interface Runtime {
   staleAutomaticRun: boolean;
   retryOwner: { goalId: string; goalGeneration: number; activationEpoch: number } | null;
   retryCreatedGoal: { goalId: string; goalGeneration: number; activationEpoch: number } | null;
+  retryFailure: { goalId: string; goalGeneration: number; activationEpoch: number; reason: string } | null;
   staleRetry: boolean;
   settlementOwner: { goalId: string | null; goalGeneration: number; activationEpoch: number; goal?: GoalState } | null;
+  terminalToolCallPending: { run: ActiveRun; toolCallId: string } | null;
+  stalledAutomaticTurns: number;
   reloadFence: ReloadFence | null;
   nextDispatchId: number;
 }
@@ -628,6 +633,14 @@ function hasToolActivity(messages: any[]): boolean {
   });
 }
 
+function hasMeaningfulToolActivity(messages: any[]): boolean {
+  return messages.some(message => {
+    if (message?.role === "toolResult") return message.toolName !== "get_goal";
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+    return message.content.some((part: any) => part?.type === "toolCall" && part.name !== "get_goal");
+  });
+}
+
 function textContent(message: any): string | null {
   if (typeof message?.content === "string") return message.content;
   if (!Array.isArray(message?.content)) return null;
@@ -659,6 +672,16 @@ function isWorkspaceMutationTool(event: ToolCallEvent, goal: GoalState | null): 
   // The caller still owns the fresh/read-only evaluator contract.
   if (isEvaluationHandoff(event, goal)) return false;
   return true;
+}
+
+function isValidTerminalUpdate(event: ToolCallEvent, goal: GoalState | null): boolean {
+  if (event.toolName !== "update_goal" || !goal || goal.status !== "active" || !isRecord(event.input)) return false;
+  if (event.input.status === "complete") {
+    return goal.lastEvaluation?.verdict === "achieved"
+      && goal.lastEvaluation.revision === goal.revision
+      && Boolean(goal.lastEvaluation.evidence?.trim());
+  }
+  return event.input.status === "blocked" && typeof event.input.blocker === "string" && Boolean(event.input.blocker.trim());
 }
 
 interface ProviderUsage {
@@ -773,8 +796,11 @@ export default function piGoal(pi: ExtensionAPI) {
     staleAutomaticRun: false,
     retryOwner: null,
     retryCreatedGoal: null,
+    retryFailure: null,
     staleRetry: false,
     settlementOwner: null,
+    terminalToolCallPending: null,
+    stalledAutomaticTurns: 0,
     reloadFence: null,
     nextDispatchId: 0,
   };
@@ -788,7 +814,11 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function advanceActivation(newGeneration = false): void {
     rt.activationEpoch = boundedAdd(rt.activationEpoch, 1);
-    if (newGeneration) rt.goalGeneration = boundedAdd(rt.goalGeneration, 1);
+    if (newGeneration) {
+      rt.goalGeneration = boundedAdd(rt.goalGeneration, 1);
+      rt.stalledAutomaticTurns = 0;
+    }
+    rt.retryFailure = null;
     if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.createdGoalId !== undefined || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
     rt.kickoff = null;
     rt.pendingContinuation = null;
@@ -976,9 +1006,31 @@ export default function piGoal(pi: ExtensionAPI) {
     ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use ${resumeHint} to continue.`, "info");
   }
 
+  function blockGoal(goal: GoalState, blocker: string, stopReason: string, ctx: ExtensionContext): void {
+    advanceActivation();
+    goal.status = "blocked";
+    goal.blocker = truncate(blocker);
+    goal.stopReason = truncate(stopReason);
+    touch(goal);
+    syncActiveTools();
+    persistPatch(pi, goal);
+    updateWidget(ctx);
+  }
+
   function finalAssistantStopReason(messages: any[]): string | undefined {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]?.role === "assistant") return messages[i].stopReason;
+    }
+    return undefined;
+  }
+
+  function finalAssistantError(messages: any[]): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message?.role !== "assistant") continue;
+      return typeof message.errorMessage === "string" && message.errorMessage.trim()
+        ? truncate(message.errorMessage.trim())
+        : undefined;
     }
     return undefined;
   }
@@ -1190,7 +1242,9 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.pendingContinuation = null;
     rt.retryOwner = null;
     rt.retryCreatedGoal = null;
+    rt.retryFailure = null;
     rt.staleRetry = false;
+    rt.stalledAutomaticTurns = 0;
     if (!preserveSettlementOwner) rt.settlementOwner = null;
     rt.pendingUserRun = null;
     if (!preserveActiveRun) rt.activeRun = null;
@@ -1247,7 +1301,7 @@ export default function piGoal(pi: ExtensionAPI) {
     // run before replacing the branch state; its stale provider work must not
     // reach the selected branch or be charged to its reconstructed goal.
     if (!ctx.isIdle()) ctx.abort();
-    reconstruct(ctx, false, false, true, true);
+    reconstruct(ctx, false, false, false, true);
     restoreAutomaticUserNudges(ctx);
     if (rt.activeRun) rt.activeRun.discardUsage = true;
     invalidateRestoredEvaluation(ctx);
@@ -1288,8 +1342,11 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.pendingContinuation = null;
     rt.retryOwner = null;
     rt.retryCreatedGoal = null;
+    rt.retryFailure = null;
     rt.staleRetry = false;
+    rt.stalledAutomaticTurns = 0;
     rt.settlementOwner = null;
+    rt.terminalToolCallPending = null;
     rt.reloadFence = null;
     rt.pendingUserRun = null;
     rt.activeRun = null;
@@ -1436,6 +1493,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.userInputQueued = false;
     rt.pendingUserRun = null;
     rt.startupPending = false;
+    rt.terminalToolCallPending = null;
     const goal = rt.goal;
     const automaticRun = rt.automaticRun;
     const automaticOwnsRun = automaticRun !== null && matchesCurrentContinuation(automaticRun);
@@ -1503,6 +1561,7 @@ export default function piGoal(pi: ExtensionAPI) {
       compactionHandoff: false,
       turnsSeen: new Set(),
       hadToolActivity: false,
+      hadMeaningfulActivity: false,
     };
     if (!ownerGoal) return;
     if (markLimitIfNeeded(ownerGoal)) {
@@ -1567,7 +1626,9 @@ export default function piGoal(pi: ExtensionAPI) {
       const run = rt.activeRun;
       if (!run || run.turnsSeen.has(event.turnIndex)) return;
       run.turnsSeen.add(event.turnIndex);
-      run.hadToolActivity ||= (event.toolResults?.length ?? 0) > 0 || hasToolActivity([event.message]);
+      const turnMessages = [event.message, ...(event.toolResults ?? [])];
+      run.hadToolActivity ||= (event.toolResults?.length ?? 0) > 0 || hasToolActivity(turnMessages);
+      run.hadMeaningfulActivity ||= hasMeaningfulToolActivity(turnMessages);
       // Tree reconstruction fenced this run. Its provider result belongs to
       // the abandoned branch and must not mutate or charge the replacement.
       if (run.discardUsage) return;
@@ -1606,11 +1667,16 @@ export default function piGoal(pi: ExtensionAPI) {
       const run = rt.activeRun;
       rt.automaticRun = null;
       rt.activeRun = null;
-      if (!run) return;
+      if (!run) {
+        rt.terminalToolCallPending = null;
+        return;
+      }
+      if (rt.terminalToolCallPending?.run === run) rt.terminalToolCallPending = null;
       const goal = rt.goal;
       const finalStopReason = finalAssistantStopReason(event.messages);
       const interrupted = finalStopReason === "aborted";
       const failed = finalStopReason === "error";
+      const failureReason = finalAssistantError(event.messages) ?? "Provider retries were exhausted after an error.";
 
       // Only a goal created by a tool in this run may claim an otherwise
       // unrelated run. A user turn must not inherit a goal that was resumed
@@ -1645,6 +1711,7 @@ export default function piGoal(pi: ExtensionAPI) {
       }
       if (!run.goalId) {
         if (createdGoalOwnsRun && failed && !interrupted) {
+          rt.retryFailure = { goalId: goal!.id, goalGeneration: rt.goalGeneration, activationEpoch: rt.activationEpoch, reason: failureReason };
           rt.retryCreatedGoal = { goalId: goal!.id, goalGeneration: rt.goalGeneration, activationEpoch: rt.activationEpoch };
         } else if (createdGoalOwnsRun && interrupted) {
           advanceActivation();
@@ -1655,10 +1722,13 @@ export default function piGoal(pi: ExtensionAPI) {
           persistPatch(pi, goal!);
           updateWidget(ctx);
           ctx.ui.notify("Goal paused after interruption. Use /goal resume to continue.", "info");
-        } else if (createdGoalOwnsRun && run.hadToolActivity && !failed) {
-          persistPatch(pi, goal!);
-          updateWidget(ctx);
-          continuationToken = currentContinuation(goal!);
+        } else if (createdGoalOwnsRun && !failed && !interrupted) {
+          rt.retryFailure = null;
+          if (run.hadToolActivity) {
+            persistPatch(pi, goal!);
+            updateWidget(ctx);
+            continuationToken = currentContinuation(goal!);
+          }
         }
         return;
       }
@@ -1667,8 +1737,11 @@ export default function piGoal(pi: ExtensionAPI) {
       // cannot pause or continue the resumed goal.
       if (run.goalGeneration !== rt.goalGeneration) return;
       if (failed && !interrupted && (goal.status === "active" || goal.status === "budget_limited")) {
+        if (goal.status === "active") rt.retryFailure = { goalId: goal.id, goalGeneration: run.goalGeneration, activationEpoch: rt.activationEpoch, reason: failureReason };
         rt.retryOwner = { goalId: goal.id, goalGeneration: run.goalGeneration, activationEpoch: rt.activationEpoch };
         if (goal.status === "budget_limited") rt.staleRetry = true;
+      } else if (!failed && !interrupted && rt.retryFailure?.goalId === goal.id && rt.retryFailure.goalGeneration === run.goalGeneration) {
+        rt.retryFailure = null;
       }
       if (interrupted && goal.status === "active") {
         advanceActivation();
@@ -1683,6 +1756,17 @@ export default function piGoal(pi: ExtensionAPI) {
       }
       // A turn_end handler has already accounted every provider call. Do not
       // inspect agent_end messages for usage: they include the whole run.
+      const automaticGoalTurn = run.automaticDispatchId !== undefined || (!run.userOwned && run.goalId !== null);
+      if (run.hadMeaningfulActivity) {
+        rt.stalledAutomaticTurns = 0;
+      } else if (!failed && !interrupted && automaticGoalTurn) {
+        rt.stalledAutomaticTurns += 1;
+        if (rt.stalledAutomaticTurns >= MAX_STALLED_AUTOMATIC_TURNS) {
+          blockGoal(goal, `No meaningful progress after ${MAX_STALLED_AUTOMATIC_TURNS} automatic turns.`, "automatic loop paused after repeated no-progress turns", ctx);
+          ctx.ui.notify("Goal blocked after repeated automatic turns without meaningful progress. Use /goal resume after choosing a new step.", "warning");
+          return;
+        }
+      }
       goal.updatedAt = now();
       persistPatch(pi, goal);
       updateWidget(ctx);
@@ -1692,7 +1776,6 @@ export default function piGoal(pi: ExtensionAPI) {
       // an active goal stranded with no wake-up. User-owned turns still only
       // hand off after tool activity (or a retry-created goal) so an ordinary
       // user reply does not unexpectedly recurse.
-      const automaticGoalTurn = run.automaticDispatchId !== undefined || (!run.userOwned && run.goalId !== null);
       if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) {
         continuationToken = currentContinuation(goal);
         forceAction = automaticGoalTurn && !run.hadToolActivity;
@@ -1702,6 +1785,23 @@ export default function piGoal(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    const failure = rt.retryFailure;
+    const goal = rt.goal;
+    const ownsCurrentGoal = failure !== null
+      && goal?.status === "active"
+      && goal.id === failure.goalId
+      && rt.goalGeneration === failure.goalGeneration
+      && rt.activationEpoch === failure.activationEpoch;
+    if (ownsCurrentGoal && goal) {
+      blockGoal(goal, failure.reason, "provider retries exhausted after an error", ctx);
+      rt.retryFailure = null;
+      rt.settlementOwner = null;
+      rt.retryOwner = null;
+      rt.retryCreatedGoal = null;
+      ctx.ui.notify("Goal blocked after provider retries were exhausted. Use /goal resume when the provider is available.", "warning");
+      return;
+    }
+    rt.retryFailure = null;
     rt.settlementOwner = null;
     rt.retryOwner = null;
     rt.retryCreatedGoal = null;
@@ -1715,8 +1815,8 @@ export default function piGoal(pi: ExtensionAPI) {
       drainPendingContinuation(ctx);
       return;
     }
-    const goal = rt.goal;
-    if (!goal || goal.status !== "active" || !matchesCurrentContinuation(kickoff)) {
+    const kickoffGoal = rt.goal;
+    if (!kickoffGoal || kickoffGoal.status !== "active" || !matchesCurrentContinuation(kickoff)) {
       rt.kickoff = null;
       return;
     }
@@ -1794,6 +1894,16 @@ export default function piGoal(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
+    const pendingTerminal = rt.terminalToolCallPending;
+    if (pendingTerminal && pendingTerminal.run !== rt.activeRun) {
+      rt.terminalToolCallPending = null;
+    } else if (pendingTerminal && pendingTerminal.toolCallId !== event.toolCallId) {
+      return { block: true };
+    }
+    if (isValidTerminalUpdate(event, rt.goal) && rt.activeRun) {
+      rt.terminalToolCallPending = { run: rt.activeRun, toolCallId: event.toolCallId };
+    }
+    if (rt.activeRun && event.toolName !== "get_goal") rt.activeRun.hadMeaningfulActivity = true;
     if (event.toolName === "workflow" && rt.goal?.status === "active" && (event.input as Record<string, unknown>).background !== false) {
       ctx.ui.notify("Background pi-workflows runs are blocked while a goal is active. Use background:false to avoid racing goal continuation.", "warning");
       return { block: true };
@@ -1946,6 +2056,7 @@ export default function piGoal(pi: ExtensionAPI) {
           syncActiveTools();
           persistPatch(pi, goal);
           updateWidget(ctx);
+          rt.stopNextAgentStart = true;
           return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}\nUsage: ${formatUsage(goal)}` }], details: { goal: goalDetails(goal) }, terminate: true };
         }
 
@@ -1960,6 +2071,7 @@ export default function piGoal(pi: ExtensionAPI) {
         syncActiveTools();
         persistPatch(pi, goal);
         updateWidget(ctx);
+        rt.stopNextAgentStart = true;
         return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${goal.blocker}` }], details: { goal: goalDetails(goal) }, terminate: true };
       });
     },

@@ -54,6 +54,7 @@ Pause, resume, clear, and limit changes are deliberately user-command-only.
 - **Authoritative usage.** At `agent_start`, usage is bound to the goal active for that run. Each parent provider turn increments `turns` exactly once; `cost` and token totals include the parent response plus Pi-recorded nested tool, compaction, and branch-summary usage. Omitted limits are unlimited. An explicit USD threshold is checked after provider usage is reported, so one call may overshoot; an explicit `maxTurns` limit aborts before another turn. Unlimited is deliberate: Pi cannot turn a ChatGPT subscription quota or an API provider's account limit into a reliable per-goal USD ceiling. Use explicit limits when you want a local stop condition; provider and plan limits still apply.
 - **Session scope.** State is stored with `pi.appendEntry()` and reconstructed from the current session branch. `/tree` reconstructs state but does not schedule a turn until a prompt is submitted in the selected branch. Compaction may append a state snapshot while preserving Pi's normal summary. Continuations are queued through Pi's agent lifecycle, so Pi performs its auto-compaction check before draining them; a terminating `compact` handoff is instead left to the compaction extension's idle recovery so two wake-ups cannot race.
 - **Workflow safety.** While a goal is active, pi-workflows calls with background/detached execution are blocked. Blocking calls expose child usage in their result details, and failed/cancelled calls carry a bounded usage marker so goal budgets remain authoritative.
+- **Failure and progress bounds.** Pi owns transient provider retries; when retries settle with an error, the goal becomes `blocked` with the provider error. Three consecutive automatic turns without meaningful tool activity also block the loop so indefinite goals do not become infinite no-op loops. Resume after correcting the provider or choosing a new step.
 - **No destructive automation.** Iteration labels are logical `kept`/`reverted` experiment results. pi-goal never runs Git commands or arbitrary shell hooks.
 - **Serialized and bounded state.** Goal mutations are queued. Persisted notes, evidence, arrays, numbers, and limits are validated or bounded during reconstruction. Prompt data blocks escape embedded closing markers and are explicitly untrusted.
 
@@ -61,7 +62,7 @@ Pause, resume, clear, and limit changes are deliberately user-command-only.
 
 ```text
 active → complete       (current-revision evaluation says achieved)
-active → blocked        (external input/dependency required)
+active → blocked        (external input/dependency, exhausted provider retries, or repeated no-progress)
 active → budget_limited (an explicit USD or turn limit reached)
 active → paused         (/goal pause or user interruption)
 paused/blocked/limited → active (/goal resume; add headroom only for a reached limit)
