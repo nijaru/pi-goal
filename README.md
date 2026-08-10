@@ -18,7 +18,7 @@ Requires Pi `>=0.81.0` for lifecycle-settlement and usage accounting events.
 /goal all tests pass and lint is clean
 ```
 
-`/goal` starts the loop directly with unlimited USD and turn limits. Add `--budget N` and/or `--max-turns N` when you want hard bounds. It does not ask the model to create a second goal or invent limits. With no arguments, `/goal` shows status.
+`/goal` starts the loop directly with unlimited USD and turns. Add `--budget N` and/or `--max-turns N` when you want hard bounds. It does not ask the model to create a second goal or invent limits. With no arguments, `/goal` shows status.
 
 ## User Commands
 
@@ -29,7 +29,7 @@ Requires Pi `>=0.81.0` for lifecycle-settlement and usage accounting events.
 | `/goal --budget 5 --max-turns 20 <condition>` | Start with explicit hard limits; either option may be used alone (`unlimited` removes one) |
 | `/goal edit <condition>` | Replace the current goal (unlimited unless limits are supplied) |
 | `/goal pause` | Pause the loop |
-| `/goal resume [--budget N|unlimited] [--max-turns N|unlimited]` | Resume a paused, blocked, or limited goal; only a reached limit needs new headroom |
+| `/goal resume [--budget N|unlimited] [--max-turns N|unlimited]` | Resume a paused, blocked, or limited goal; a reached limit is lifted when no replacement is supplied |
 | `/goal clear` | Clear the goal and persist a tombstone |
 
 Pause, resume, clear, and limit changes are deliberately user-command-only.
@@ -51,7 +51,7 @@ Pause, resume, clear, and limit changes are deliberately user-command-only.
 
 - **Evidence gate.** `update_goal({status: "complete"})` requires `evaluate_goal` to have recorded `achieved` with non-empty evidence for the current goal revision. Workspace-mutating tools, `user_bash`, session restart, and `/tree` reconstruction invalidate that evaluation; requesting an evaluation and then completing it does not.
 - **Evaluator contract.** The extension returns an adversarial evaluation prompt, but the caller must provide a genuinely fresh, read-only evaluator context. A single-mode `subagent` handoff containing the pending token is supported while evaluation is pending; parallel, chained, or token-smuggling calls invalidate the request. The caller still owns freshness and read-only behavior, which pi-goal cannot cryptographically guarantee.
-- **Authoritative usage.** At `agent_start`, usage is bound to the goal active for that run. Each parent provider turn increments `turns` exactly once; `cost` and token totals include the parent response plus Pi-recorded nested tool, compaction, and branch-summary usage. Omitted limits are unlimited. An explicit USD threshold is checked after provider usage is reported, so one call may overshoot; an explicit `maxTurns` limit aborts before another turn. Unlimited is deliberate: Pi cannot turn a ChatGPT subscription quota or an API provider's account limit into a reliable per-goal USD ceiling. Use explicit limits when you want a local stop condition; provider and plan limits still apply.
+- **Authoritative usage.** At `agent_start`, usage is bound to the goal active for that run. Each parent provider turn increments `turns` exactly once; `cost` and token totals include the parent response plus Pi-recorded nested tool, compaction, and branch-summary usage. Omitted limits are unlimited. An explicit USD threshold is checked after provider usage is reported, so one call may overshoot; an explicit `maxTurns` limit aborts before another turn. `/goal resume` lifts a reached limit when no replacement is supplied, while explicit replacements still require headroom. Unlimited is deliberate: Pi cannot turn a ChatGPT subscription quota or an API provider's account limit into a reliable per-goal USD ceiling. Use explicit limits when you want a local stop condition; provider and plan limits still apply.
 - **Session scope.** State is stored with `pi.appendEntry()` and reconstructed from the current session branch. `/tree` reconstructs state but does not schedule a turn until a prompt is submitted in the selected branch. Compaction may append a state snapshot while preserving Pi's normal summary. Continuations are queued through Pi's agent lifecycle, so Pi performs its auto-compaction check before draining them; a terminating `compact` handoff is instead left to the compaction extension's idle recovery so two wake-ups cannot race.
 - **Workflow safety.** While a goal is active, pi-workflows calls with background/detached execution are blocked. Blocking calls expose child usage in their result details, and failed/cancelled calls carry a bounded usage marker so goal budgets remain authoritative.
 - **Failure and progress bounds.** Pi owns transient provider retries; when retries settle with an error, the goal becomes `blocked` with the provider error. Three consecutive automatic turns without meaningful tool activity also block the loop so indefinite goals do not become infinite no-op loops. Resume after correcting the provider or choosing a new step.
@@ -71,6 +71,6 @@ any goal state → cleared (/goal clear or replacement)
 
 ## Persistence
 
-The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs and normal follow-ups are hidden, attributed custom messages. When a goal-owned provider turn returns prose without tool activity, pi-goal waits for the current run to settle, appends its hidden lifecycle marker, and starts one paired, lifecycle-fenced user-role follow-up so the next turn receives an actionable prompt; this avoids a separate no-op provider turn. This is an extension-API workaround, not simulated user input.
+The canonical state is stored in Pi's session file as custom entries. Iterations and ideas are part of the goal state, so restart, resume, and `/tree` reconstruction do not depend on project files. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, so it cannot race Pi's initial prompt. A fork starts without inheriting the parent goal. The former project-global `.pi/goal` format is intentionally not auto-imported. Goal kickoffs and normal follow-ups are hidden, attributed custom messages. When a goal-owned provider turn returns prose or failed tool calls without meaningful progress, pi-goal queues one lifecycle-fenced custom continuation whose prompt explicitly requires a concrete tool step; this keeps dispatch, retries, compaction, and stale-message fencing on Pi's observable lifecycle instead of relying on an unobservable extension user-message call.
 
 MIT

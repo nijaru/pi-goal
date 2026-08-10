@@ -38,7 +38,6 @@ const MAX_TEXT = 1_000;
 const MAX_EVIDENCE = 2_000;
 const MAX_ITERATIONS = 500;
 const MAX_IDEAS = 100;
-const MAX_AUTOMATIC_USER_NUDGES = 64;
 const MAX_STALLED_AUTOMATIC_TURNS = 3;
 const GOAL_PROGRESS_TOOLS = ["get_goal", "update_goal", "evaluate_goal", "log_iteration", "log_idea"] as const;
 // pi-workflows cannot attach details when its tool execute() throws. Its
@@ -136,16 +135,7 @@ interface ContinuationRequest {
 
 interface AutomaticDispatch extends ContinuationRequest {
   dispatchId: string;
-}
-
-interface AutomaticUserNudge extends AutomaticDispatch {
-  content: string;
-}
-
-interface PendingAutomaticUserNudge {
-  dispatch: AutomaticDispatch;
-  content: string;
-  deliveryStarted: boolean;
+  forceAction: boolean;
 }
 
 interface ActiveRun {
@@ -174,7 +164,7 @@ interface ActiveRun {
 interface Runtime {
   goal: GoalState | null;
   activeRun: ActiveRun | null;
-  stopNextAgentStart: boolean;
+  stopRun: ActiveRun | null;
   userInputQueued: boolean;
   startupPending: boolean;
   activationId: string;
@@ -183,10 +173,8 @@ interface Runtime {
   kickoff: ContinuationRequest | null;
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
   pendingContinuation: { token: ContinuationRequest; forceAction: boolean } | null;
-  pendingAutomaticUserNudge: PendingAutomaticUserNudge | null;
   compactionRecovery: ContinuationRequest | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
-  automaticUserNudges: Map<string, AutomaticUserNudge>;
   automaticRun: AutomaticDispatch | null;
   staleAutomaticRun: boolean;
   retryOwner: { goalId: string; goalGeneration: number; activationEpoch: number } | null;
@@ -325,17 +313,24 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
   return result;
 }
 
-function isMonotonicLimit(previous: number | null, next: number | null): boolean {
-  // Limits are user-controlled policy. An explicit limit may be raised or
-  // removed, and an unlimited goal may later receive a hard limit.
-  return previous === null || next === null || next >= previous;
+function isMonotonicLimit(previous: number | null, next: number | null, usage: number, status: GoalStatus): boolean {
+  // Limits are user-controlled policy. An explicit limit may be raised,
+  // lowered while it still has headroom, or removed. A reached limited goal
+  // cannot be rewritten to a stricter cap by a stale patch.
+  if (next === null) return true;
+  if (previous === null) return status !== "budget_limited" && usage < next;
+  if (next >= previous) return true;
+  return status !== "budget_limited" && usage < next;
 }
 
 function isMonotonicState(previous: GoalState, next: GoalState): boolean {
   if (previous.id !== next.id || previous.sessionId !== next.sessionId) return false;
   if (previous.status === "complete" && next.status !== "complete" && next.status !== "cleared") return false;
   if (next.status !== "cleared" && previous.status === "cleared") return false;
-  if (!isMonotonicLimit(previous.budget, next.budget) || !isMonotonicLimit(previous.maxTurns, next.maxTurns) || next.revision < previous.revision) return false;
+  if (!isMonotonicLimit(previous.budget, next.budget, next.usage.cost, next.status) || !isMonotonicLimit(previous.maxTurns, next.maxTurns, next.usage.turns, next.status) || next.revision < previous.revision) return false;
+  const budgetTightened = next.budget !== null && (previous.budget === null || next.budget < previous.budget);
+  const turnsTightened = next.maxTurns !== null && (previous.maxTurns === null || next.maxTurns < previous.maxTurns);
+  if (next.revision === previous.revision && (budgetTightened || turnsTightened)) return false;
   const previousUsage = previous.usage;
   const nextUsage = next.usage;
   if (nextUsage.turns < previousUsage.turns || nextUsage.inputTokens < previousUsage.inputTokens || nextUsage.outputTokens < previousUsage.outputTokens || nextUsage.totalTokens < previousUsage.totalTokens || nextUsage.cost < previousUsage.cost) return false;
@@ -511,8 +506,8 @@ function validateResume(goal: GoalState, requestedBudget?: unknown, requestedMax
   if (maxTurns !== null && !isBoundedInteger(maxTurns, MAX_MAX_TURNS)) {
     throw new Error(`Resume maxTurns must be a positive integer no greater than ${MAX_MAX_TURNS}.`);
   }
-  const nextBudget = goal.budget === null || budget === null ? budget : Math.max(goal.budget, budget);
-  const nextMaxTurns = goal.maxTurns === null || maxTurns === null ? maxTurns : Math.max(goal.maxTurns, maxTurns);
+  const nextBudget = budget;
+  const nextMaxTurns = maxTurns;
   if (nextBudget !== null && nextBudget <= goal.usage.cost) {
     throw new Error("Resume requires budget headroom above current usage.");
   }
@@ -637,11 +632,12 @@ function hasToolActivity(messages: any[]): boolean {
 }
 
 function hasMeaningfulToolActivity(messages: any[]): boolean {
-  return messages.some(message => {
-    if (message?.role === "toolResult") return message.toolName !== "get_goal";
-    if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
-    return message.content.some((part: any) => part?.type === "toolCall" && part.name !== "get_goal");
-  });
+  // A tool call is only meaningful once it has produced a non-error result.
+  // Counting the assistant request lets repeated failures reset the automatic
+  // no-progress breaker indefinitely.
+  return messages.some(message => message?.role === "toolResult"
+    && message.toolName !== "get_goal"
+    && message.isError !== true);
 }
 
 function textContent(message: any): string | null {
@@ -783,7 +779,7 @@ export default function piGoal(pi: ExtensionAPI) {
   const rt: Runtime = {
     goal: null,
     activeRun: null,
-    stopNextAgentStart: false,
+    stopRun: null,
     userInputQueued: false,
     startupPending: false,
     activationId: randomUUID().replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 16),
@@ -792,10 +788,8 @@ export default function piGoal(pi: ExtensionAPI) {
     kickoff: null,
     pendingUserRun: null,
     pendingContinuation: null,
-    pendingAutomaticUserNudge: null,
     compactionRecovery: null,
     automaticDispatches: new Map(),
-    automaticUserNudges: new Map(),
     automaticRun: null,
     staleAutomaticRun: false,
     retryOwner: null,
@@ -826,7 +820,6 @@ export default function piGoal(pi: ExtensionAPI) {
     if (rt.activeRun && (rt.activeRun.goalId !== null || rt.activeRun.createdGoalId !== undefined || rt.activeRun.staleSynthetic)) rt.activeRun.staleSynthetic = true;
     rt.kickoff = null;
     rt.pendingContinuation = null;
-    rt.pendingAutomaticUserNudge = null;
     rt.compactionRecovery = null;
     // Dispatch identities belong to the fenced activation. Stale delivered
     // messages are still rejected by their embedded generation token, so the
@@ -858,83 +851,6 @@ export default function piGoal(pi: ExtensionAPI) {
   function nextDispatchId(): string {
     rt.nextDispatchId = boundedAdd(rt.nextDispatchId, 1);
     return `${rt.activationId}-${rt.activationEpoch}-${rt.nextDispatchId}`;
-  }
-
-  function rememberAutomaticUserNudge(dispatch: AutomaticDispatch, content: string): void {
-    rt.automaticUserNudges.set(dispatch.dispatchId, { ...dispatch, content });
-    while (rt.automaticUserNudges.size > MAX_AUTOMATIC_USER_NUDGES) {
-      const oldest = rt.automaticUserNudges.keys().next().value;
-      if (typeof oldest !== "string") break;
-      rt.automaticUserNudges.delete(oldest);
-    }
-  }
-
-  function rememberAutomaticUserNudgeFromMessage(message: any): void {
-    if (message?.details?.forceAction !== true) return;
-    const dispatchId = message.details?.dispatchId;
-    const goalId = message.details?.goalId;
-    const activationId = message.details?.activationId;
-    const activationEpoch = message.details?.activationEpoch;
-    const content = textContent(message);
-    if (typeof dispatchId !== "string" || typeof goalId !== "string" || typeof activationId !== "string" || !isBoundedInteger(activationEpoch, MAX_PERSISTED_NUMBER) || !content) return;
-    rememberAutomaticUserNudge({ dispatchId, goalId, activationId, activationEpoch }, content);
-  }
-
-  function consumeAutomaticUserNudge(message: any): AutomaticUserNudge | null {
-    if (message?.role !== "user") return null;
-    const content = textContent(message);
-    if (!content) return null;
-    const activeDispatchId = rt.activeRun?.automaticDispatchId;
-    if (activeDispatchId) {
-      const current = rt.automaticUserNudges.get(activeDispatchId);
-      if (current?.content === content) {
-        rt.automaticUserNudges.delete(activeDispatchId);
-        rt.automaticDispatches.delete(activeDispatchId);
-        if (rt.pendingAutomaticUserNudge?.dispatch.dispatchId === activeDispatchId) rt.pendingAutomaticUserNudge = null;
-        return current;
-      }
-    }
-    for (const [dispatchId, nudge] of rt.automaticUserNudges) {
-      if (nudge.content !== content) continue;
-      rt.automaticUserNudges.delete(dispatchId);
-      rt.automaticDispatches.delete(dispatchId);
-      if (rt.pendingAutomaticUserNudge?.dispatch.dispatchId === dispatchId) rt.pendingAutomaticUserNudge = null;
-      return nudge;
-    }
-    return null;
-  }
-
-  function restoreAutomaticUserNudges(ctx: ExtensionContext): void {
-    // A force-action marker is persisted before its paired user message is
-    // started. Rebuild only identities whose pair is still pending after
-    // reload. Historical markers whose user message was already persisted are
-    // complete; restoring them would make a later identical user prompt look
-    // stale and abort unrelated work.
-    const pending = new Map<string, any>();
-    for (const entry of ctx.sessionManager.getBranch() as any[]) {
-      if (entry?.type === "custom_message" && entry.customType === GOAL_CONTINUATION && entry.details?.forceAction === true) {
-        const marker = { role: "custom", content: entry.content, details: entry.details };
-        const dispatchId = entry.details?.dispatchId;
-        if (typeof dispatchId === "string") {
-          pending.set(dispatchId, marker);
-          while (pending.size > MAX_AUTOMATIC_USER_NUDGES) {
-            const oldest = pending.keys().next().value;
-            if (typeof oldest !== "string") break;
-            pending.delete(oldest);
-          }
-        }
-        continue;
-      }
-      if (entry?.type !== "message" || entry.message?.role !== "user") continue;
-      const content = textContent(entry.message);
-      if (!content) continue;
-      for (const [dispatchId, marker] of pending) {
-        if (textContent(marker) !== content) continue;
-        pending.delete(dispatchId);
-        break;
-      }
-    }
-    for (const marker of pending.values()) rememberAutomaticUserNudgeFromMessage(marker);
   }
 
   function syncActiveTools(): void {
@@ -1003,12 +919,12 @@ export default function piGoal(pi: ExtensionAPI) {
     // no longer counts toward the limited goal.
     const userWorkQueued = hasAdmittedUserWork(ctx);
     rt.userInputQueued = userWorkQueued;
-    rt.stopNextAgentStart = !userWorkQueued;
+    rt.stopRun = userWorkQueued ? null : rt.activeRun;
     if (!userWorkQueued) ctx.abort();
     const resumeHint = goal.stopReason === "turn limit reached"
-      ? "/goal resume --max-turns N"
+      ? "/goal resume (or --max-turns N)"
       : goal.stopReason === "USD budget exhausted"
-        ? "/goal resume --budget N"
+        ? "/goal resume (or --budget N)"
         : "/goal resume with additional headroom";
     ctx.ui.notify(`Goal stopped: ${goal.stopReason}. Use ${resumeHint} to continue.`, "info");
   }
@@ -1066,87 +982,47 @@ export default function piGoal(pi: ExtensionAPI) {
     return rt.userInputQueued || (rt.pendingUserRun !== null && ctx.hasPendingMessages());
   }
 
-  function sendContinuation(goal: GoalState, forceAction = false): void {
+  function sendContinuation(goal: GoalState, ctx: ExtensionContext, forceAction = false): void {
     const token = currentContinuation(goal);
     if (hasAutomaticDispatch(token)) {
       rt.pendingContinuation = null;
       return;
     }
     rt.pendingContinuation = null;
-    const dispatch: AutomaticDispatch = { ...token, dispatchId: nextDispatchId() };
+    const dispatch: AutomaticDispatch = { ...token, dispatchId: nextDispatchId(), forceAction };
     rt.automaticDispatches.set(dispatch.dispatchId, dispatch);
     // Pi checks auto-compaction before draining follow-ups queued from
     // agent_end. Keep the custom dispatch marker hidden so lifecycle fencing
-    // can identify stale work. A prose-only automatic turn needs a real user
-    // message, but queuing both messages as follow-ups would make Pi deliver
-    // the custom marker in a separate no-op provider turn when follow-up mode
-    // is one-at-a-time (the default). Defer that pair until the current run
-    // settles, append the hidden marker while idle, and then start exactly one
-    // user-owned-by-the-extension turn containing both entries.
+    // can identify stale work. Force-action turns use the same lifecycle-
+    // observable custom-message path as ordinary continuations; the prompt
+    // explicitly requires a concrete tool step instead of relying on a
+    // fire-and-forget user-message wrapper.
     const content = buildContinuationPrompt(goal, forceAction);
-    if (forceAction) {
-      rememberAutomaticUserNudge(dispatch, content);
-      rt.pendingAutomaticUserNudge = { dispatch, content, deliveryStarted: false };
-      return;
+    try {
+      const delivery = pi.sendMessage({
+        customType: GOAL_CONTINUATION,
+        content,
+        display: false,
+        details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId, forceAction },
+      }, { triggerTurn: true, deliverAs: "followUp" }) as unknown as PromiseLike<unknown> | undefined;
+      if (delivery && typeof delivery.then === "function") {
+        void Promise.resolve(delivery).catch(error => failAutomaticDispatch(dispatch, error, ctx));
+      }
+    } catch (error) {
+      failAutomaticDispatch(dispatch, error, ctx);
     }
-    pi.sendMessage({
-      customType: GOAL_CONTINUATION,
-      content,
-      display: false,
-      details: { goalId: goal.id, activationId: dispatch.activationId, activationEpoch: dispatch.activationEpoch, dispatchId: dispatch.dispatchId, forceAction },
-    }, { triggerTurn: true, deliverAs: "followUp" });
   }
 
-  function failAutomaticUserNudge(dispatch: AutomaticDispatch, error: unknown, ctx: ExtensionContext): void {
-    const reason = error instanceof Error ? error.message : String(error);
+  function failAutomaticDispatch(dispatch: AutomaticDispatch, error: unknown, ctx: ExtensionContext): void {
     void mutate(() => {
-      const pending = rt.pendingAutomaticUserNudge;
-      if (!pending || pending.dispatch.dispatchId !== dispatch.dispatchId) return;
-      rt.pendingAutomaticUserNudge = null;
+      const registered = rt.automaticDispatches.get(dispatch.dispatchId);
+      if (!registered || registered !== dispatch) return;
       rt.automaticDispatches.delete(dispatch.dispatchId);
-      rt.automaticUserNudges.delete(dispatch.dispatchId);
       const goal = rt.goal;
       if (!goal || !matchesCurrentContinuation(dispatch)) return;
-      blockGoal(goal, `Automatic continuation could not be delivered: ${truncate(reason)}`, "automatic continuation delivery failed", ctx);
+      blockGoal(goal, `Automatic continuation could not be delivered: ${truncate(error instanceof Error ? error.message : String(error))}`, "automatic continuation delivery failed", ctx);
       ctx.ui.notify("Goal blocked because its automatic continuation could not be delivered. Use /goal resume after fixing the provider.", "warning");
     });
-  }
-
-  function drainPendingAutomaticUserNudge(ctx: ExtensionContext): boolean {
-    const pending = rt.pendingAutomaticUserNudge;
-    if (!pending) return false;
-    if (!matchesCurrentContinuation(pending.dispatch)) {
-      rt.pendingAutomaticUserNudge = null;
-      rt.automaticDispatches.delete(pending.dispatch.dispatchId);
-      rt.automaticUserNudges.delete(pending.dispatch.dispatchId);
-      return false;
-    }
-    if (pending.deliveryStarted || !ctx.isIdle() || hasPendingUserWork(ctx)) return false;
-    pending.deliveryStarted = true;
-    // At this idle boundary sendMessage appends the marker without starting a
-    // turn. sendUserMessage then starts one normal prompt, so the marker and
-    // actionable nudge cannot consume two provider turns. Keep the pending
-    // reservation until message_start consumes the paired user message; a
-    // preflight failure must not leave a registered dispatch with no wake-up.
-    try {
-      pi.sendMessage({
-        customType: GOAL_CONTINUATION,
-        content: pending.content,
-        display: false,
-        details: {
-          goalId: pending.dispatch.goalId,
-          activationId: pending.dispatch.activationId,
-          activationEpoch: pending.dispatch.activationEpoch,
-          dispatchId: pending.dispatch.dispatchId,
-          forceAction: true,
-        },
-      });
-      const delivery = pi.sendUserMessage(pending.content);
-      void Promise.resolve(delivery).catch(error => failAutomaticUserNudge(pending.dispatch, error, ctx));
-    } catch (error) {
-      failAutomaticUserNudge(pending.dispatch, error, ctx);
-    }
-    return true;
   }
 
   async function queueContinuation(ctx: ExtensionContext, forceAction = false): Promise<void> {
@@ -1167,7 +1043,7 @@ export default function piGoal(pi: ExtensionAPI) {
       // gate on both signals before launching synthetic work.
       if (hasPendingUserWork(ctx)) return;
       if (rt.kickoff?.goalId === goal.id && rt.kickoff.activationEpoch === rt.activationEpoch) rt.kickoff = null;
-      sendContinuation(goal, forceAction);
+      sendContinuation(goal, ctx, forceAction);
     });
   }
 
@@ -1180,8 +1056,7 @@ export default function piGoal(pi: ExtensionAPI) {
     }
     if (!ctx.isIdle() || hasPendingUserWork(ctx)) return;
     rt.pendingContinuation = null;
-    sendContinuation(rt.goal!, pending.forceAction);
-    if (pending.forceAction) drainPendingAutomaticUserNudge(ctx);
+    sendContinuation(rt.goal!, ctx, pending.forceAction);
   }
 
   function startUserContinuation(ctx: ExtensionContext): void {
@@ -1192,7 +1067,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.kickoff = token;
     if (!ctx.isIdle() || hasPendingUserWork(ctx)) return;
     rt.kickoff = null;
-    sendContinuation(goal);
+    sendContinuation(goal, ctx);
   }
 
   function scheduleResume(ctx: ExtensionContext): void {
@@ -1244,7 +1119,7 @@ export default function piGoal(pi: ExtensionAPI) {
     }
 
     advanceActivation(true);
-    rt.stopNextAgentStart = false;
+    rt.stopRun = null;
     rt.userInputQueued = false;
     rt.startupPending = false;
     const goal: GoalState = {
@@ -1287,7 +1162,7 @@ export default function piGoal(pi: ExtensionAPI) {
     if (!preserveSettlementOwner) rt.settlementOwner = null;
     rt.pendingUserRun = null;
     if (!preserveActiveRun) rt.activeRun = null;
-    rt.stopNextAgentStart = false;
+    rt.stopRun = null;
     rt.userInputQueued = false;
     rt.startupPending = startContinuation;
     rt.goal = readGoal(ctx);
@@ -1316,7 +1191,6 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
     const reloadFence = readReloadFence(ctx);
     reconstruct(ctx, true, event.reason === "fork");
-    restoreAutomaticUserNudges(ctx);
     if (reloadFence) {
       if (event.reason === "reload" && !ctx.isIdle()) {
         // Do not abort here: after replacement there is no ownership evidence
@@ -1341,7 +1215,6 @@ export default function piGoal(pi: ExtensionAPI) {
     // reach the selected branch or be charged to its reconstructed goal.
     if (!ctx.isIdle()) ctx.abort();
     reconstruct(ctx, false, false, false, true);
-    restoreAutomaticUserNudges(ctx);
     if (rt.activeRun) rt.activeRun.discardUsage = true;
     invalidateRestoredEvaluation(ctx);
     const settlementOwner = rt.settlementOwner;
@@ -1389,7 +1262,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.reloadFence = null;
     rt.pendingUserRun = null;
     rt.activeRun = null;
-    rt.stopNextAgentStart = false;
+    rt.stopRun = null;
     rt.userInputQueued = false;
     rt.startupPending = false;
     rt.goal = null;
@@ -1411,10 +1284,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
   function observeAutomaticDispatch(message: any, ctx: ExtensionContext, markStale = true): boolean {
     if (message?.role !== "custom" || message.customType !== GOAL_CONTINUATION) return false;
-    // Context scans include historical entries. Do not resurrect a consumed
-    // force-action nudge there; message_start and reload reconstruction own
-    // the pending-pair identity.
-    if (markStale) rememberAutomaticUserNudgeFromMessage(message);
     const dispatchId = message.details?.dispatchId;
     if (typeof dispatchId !== "string") {
       // Legacy continuations have no runtime-owned dispatch identity. History
@@ -1422,7 +1291,10 @@ export default function piGoal(pi: ExtensionAPI) {
       // synthetic run stale so it is aborted before an unowned provider call.
       if (markStale) {
         rt.staleAutomaticRun = true;
-        if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+        if (rt.activeRun) {
+          rt.activeRun.staleSynthetic = true;
+          if (!rt.activeRun.userMessageSeen) rt.activeRun.staleAutomaticUserMessage = true;
+        }
       }
       return true;
     }
@@ -1440,7 +1312,10 @@ export default function piGoal(pi: ExtensionAPI) {
         // delivery boundary that marks an automatic run stale.
         if (markStale) {
           rt.staleAutomaticRun = true;
-          if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+          if (rt.activeRun) {
+            rt.activeRun.staleSynthetic = true;
+            if (!rt.activeRun.userMessageSeen) rt.activeRun.staleAutomaticUserMessage = true;
+          }
         }
         return true;
       }
@@ -1457,7 +1332,10 @@ export default function piGoal(pi: ExtensionAPI) {
       return false;
     }
     rt.staleAutomaticRun = true;
-    if (rt.activeRun) rt.activeRun.staleSynthetic = true;
+    if (rt.activeRun) {
+      rt.activeRun.staleSynthetic = true;
+      if (!rt.activeRun.userMessageSeen) rt.activeRun.staleAutomaticUserMessage = true;
+    }
     return true;
   }
 
@@ -1469,6 +1347,7 @@ export default function piGoal(pi: ExtensionAPI) {
     const token = { goalId: message.details?.goalId, activationId: message.details?.activationId, activationEpoch: message.details?.activationEpoch };
     if (matchesCurrentContinuation(token)) return false;
     run.staleSynthetic = true;
+    if (!run.userMessageSeen) run.staleAutomaticUserMessage = true;
     rt.staleAutomaticRun = true;
     return true;
   }
@@ -1484,12 +1363,8 @@ export default function piGoal(pi: ExtensionAPI) {
 
   pi.on("input", event => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
-    const pendingNudge = rt.pendingAutomaticUserNudge;
-    if (pendingNudge?.deliveryStarted && rt.activeRun?.automaticDispatchId !== pendingNudge.dispatch.dispatchId) {
-      rt.pendingAutomaticUserNudge = null;
-      rt.automaticDispatches.delete(pendingNudge.dispatch.dispatchId);
-      rt.automaticUserNudges.delete(pendingNudge.dispatch.dispatchId);
-    }
+    const pendingForceDispatch = [...rt.automaticDispatches.values()].find(dispatch => dispatch.forceAction && matchesCurrentContinuation(dispatch));
+    if (pendingForceDispatch) advanceActivation();
     rt.compactionRecovery = null;
     rt.userInputQueued = true;
     rt.pendingUserRun = {
@@ -1505,9 +1380,6 @@ export default function piGoal(pi: ExtensionAPI) {
     if (event.message?.role !== "user") return;
     const run = rt.activeRun;
     if (!run) return;
-    const automaticUserNudge = consumeAutomaticUserNudge(event.message);
-    const currentAutomaticUserNudge = automaticUserNudge !== null && matchesCurrentContinuation(automaticUserNudge);
-    const staleAutomaticUserMessage = automaticUserNudge !== null && !currentAutomaticUserNudge;
     const stillOwned = run.goalId !== null
       && rt.goal?.status === "active"
       && run.goalGeneration === rt.goalGeneration
@@ -1522,26 +1394,18 @@ export default function piGoal(pi: ExtensionAPI) {
       run.automaticDispatchId = undefined;
       run.staleSynthetic = false;
     }
-    if (run.goalId === null && !run.userCandidate && !staleAutomaticUserMessage && rt.goal?.status === "active") {
-      if (currentAutomaticUserNudge) run.automaticDispatchId = automaticUserNudge.dispatchId;
-      bindActiveRunToGoal(rt.goal, !currentAutomaticUserNudge, ctx);
-    }
-    run.userOwned ||= !currentAutomaticUserNudge && !run.compactionRecovery;
+    if (run.goalId === null && !run.userCandidate && rt.goal?.status === "active") bindActiveRunToGoal(rt.goal, true, ctx);
+    run.userOwned ||= !run.compactionRecovery;
     run.userMessageSeen = true;
-    run.staleSynthetic = (run.staleSynthetic && run.goalId !== null) || staleAutomaticUserMessage;
-    run.staleAutomaticUserMessage = staleAutomaticUserMessage;
-    if (!staleAutomaticUserMessage) {
-      // A steer/follow-up can be delivered inside the existing agent run, so
-      // Pi does not emit another agent_start to clear the admission marker.
-      // Consume it at the real user-message boundary or later continuation
-      // gates can remain blocked forever. The paired automatic nudge is not
-      // that boundary; keep the marker until the user's message arrives.
-      if (!currentAutomaticUserNudge) {
-        rt.userInputQueued = false;
-        rt.pendingUserRun = null;
-      }
-      rt.staleAutomaticRun = false;
-    }
+    run.staleSynthetic = run.staleSynthetic && run.goalId !== null;
+    run.staleAutomaticUserMessage = false;
+    // A steer/follow-up can be delivered inside the existing agent run, so
+    // Pi does not emit another agent_start to clear the admission marker.
+    // Consume it at the real user-message boundary or later continuation
+    // gates can remain blocked forever.
+    rt.userInputQueued = false;
+    rt.pendingUserRun = null;
+    rt.staleAutomaticRun = false;
   });
   pi.on("agent_start", (_event: AgentStartEvent, ctx) => {
     syncActiveTools();
@@ -1582,19 +1446,12 @@ export default function piGoal(pi: ExtensionAPI) {
     const staleRetryRun = rt.staleRetry && !retryOwnsRun && !retryCreatedOwnsRun;
     rt.staleAutomaticRun = false;
     rt.staleRetry = false;
-    if (rt.stopNextAgentStart && !userInputQueued) {
-      rt.stopNextAgentStart = false;
-      rt.activeRun = null;
-      ctx.abort();
-      return;
-    }
+    if (rt.stopRun && rt.activeRun !== rt.stopRun) rt.stopRun = null;
     if (staleAutomaticRun) {
-      rt.stopNextAgentStart = false;
       rt.activeRun = null;
       ctx.abort();
       return;
     }
-    rt.stopNextAgentStart = false;
     const automaticGoal = goal?.status === "active" && (automaticOwnsRun || compactionRecoveryOwnsRun || retryOwnsRun) ? goal : undefined;
     const candidateMatches = userInputQueued
       && userInputSnapshot !== null
@@ -1698,10 +1555,13 @@ export default function piGoal(pi: ExtensionAPI) {
       if (!run.goal || !run.goalId) return;
 
       const currentGoal = rt.goal;
-      // A run from an older generation must not charge a resumed goal with the
-      // same id. Cleared/replaced goals are still accounted on their tombstone.
-      if (currentGoal?.id === run.goalId && run.goalGeneration !== rt.goalGeneration) return;
-      const goal = currentGoal?.id === run.goalId ? currentGoal : run.goal;
+      // Activation fences own continuation and lifecycle decisions, but they
+      // must not discard usage from a provider turn that completed while a
+      // user command was fencing the run. Charge an older same-id run to its
+      // captured goal object; never apply its limit transition to the current
+      // generation. Cleared/replaced goals are still accounted on tombstones.
+      const currentRunOwnsGoal = currentGoal?.id === run.goalId && run.goalGeneration === rt.goalGeneration;
+      const goal = currentRunOwnsGoal ? currentGoal! : run.goal;
       // An aborted provider attempt after a reached limit is not another goal
       // turn and must not inflate usage beyond the hard ceiling.
       if (goal.status === "budget_limited") return;
@@ -1712,12 +1572,12 @@ export default function piGoal(pi: ExtensionAPI) {
       for (const toolResult of event.toolResults ?? []) {
         recordProviderUsage(goal, toolResultUsage(toolResult));
       }
-      const limited = currentGoal?.id === run.goalId && run.goalGeneration === rt.goalGeneration && markLimitIfNeeded(goal);
+      const limited = currentRunOwnsGoal && markLimitIfNeeded(goal);
       // If a command replaced or cleared the goal during this run, preserve
       // the old goal's accounting on its tombstone, then append the current
       // goal again so the old snapshot cannot become authoritative.
       persistPatch(pi, goal);
-      if (currentGoal && currentGoal.id !== run.goalId) persistPatch(pi, currentGoal);
+      if (currentGoal && currentGoal !== goal) persistPatch(pi, currentGoal);
       updateWidget(ctx);
       if (limited) stopAfterLimit(goal, ctx);
     });
@@ -1730,6 +1590,7 @@ export default function piGoal(pi: ExtensionAPI) {
       const run = rt.activeRun;
       rt.automaticRun = null;
       rt.activeRun = null;
+      if (rt.stopRun === run) rt.stopRun = null;
       if (!run) {
         rt.terminalToolCallPending = null;
         return;
@@ -1837,18 +1698,27 @@ export default function piGoal(pi: ExtensionAPI) {
       persistPatch(pi, goal);
       updateWidget(ctx);
       // Automatic goal turns must keep the loop alive even when the model
-      // returns a text-only response. The continuation prompt explicitly
-      // requires concrete work; ending the loop on a no-tool response leaves
-      // an active goal stranded with no wake-up. User-owned turns still only
-      // hand off after tool activity (or a retry-created goal) so an ordinary
-      // user reply does not unexpectedly recurse.
+      // returns prose or failed tool calls. The continuation prompt explicitly
+      // requires concrete work; ending the loop on a no-progress response
+      // leaves an active goal stranded with no wake-up. User-owned turns still
+      // only hand off after tool activity (or a retry-created goal) so an
+      // ordinary user reply does not unexpectedly recurse.
       if (goal.status === "active" && (automaticGoalTurn || run.hadToolActivity || run.createdGoalRetry) && !failed && run.activationEpoch === rt.activationEpoch) {
         continuationToken = currentContinuation(goal);
-        forceAction = automaticGoalTurn && !run.hadToolActivity;
+        forceAction = automaticGoalTurn && !run.hadMeaningfulActivity;
       }
     });
     if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx, forceAction);
   });
+
+  function failUnacknowledgedAutomaticDispatch(ctx: ExtensionContext): boolean {
+    for (const dispatch of rt.automaticDispatches.values()) {
+      if (!matchesCurrentContinuation(dispatch)) continue;
+      failAutomaticDispatch(dispatch, new Error("prompt dispatch was not acknowledged"), ctx);
+      return true;
+    }
+    return false;
+  }
 
   pi.on("agent_settled", (_event, ctx) => {
     const failure = rt.retryFailure;
@@ -1871,7 +1741,7 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.settlementOwner = null;
     rt.retryOwner = null;
     rt.retryCreatedGoal = null;
-    if (drainPendingAutomaticUserNudge(ctx)) return;
+    if (failUnacknowledgedAutomaticDispatch(ctx)) return;
     const kickoff = rt.kickoff;
     if (!kickoff) {
       // Keep a dispatch registered until message_start consumes it. A
@@ -1940,13 +1810,17 @@ export default function piGoal(pi: ExtensionAPI) {
     }
     // turn_end calls abort(), but the core loop may reach its next provider
     // boundary before it observes the signal. Abort again at the last safe
-    // hook so a retry/follow-up receives an already-aborted signal.
-    if (rt.stopNextAgentStart && rt.userInputQueued) {
-      rt.stopNextAgentStart = false;
-      rt.userInputQueued = false;
-      return;
+    // hook so the same goal-owned run receives an already-aborted signal.
+    // Fence the run object, not the next agent start: an unrelated extension
+    // prompt must never be consumed by a stale terminal/limit stop.
+    if (rt.stopRun) {
+      if (rt.activeRun === rt.stopRun) {
+        rt.stopRun = null;
+        ctx.abort();
+        return;
+      }
+      rt.stopRun = null;
     }
-    if (rt.stopNextAgentStart) ctx.abort();
   });
 
   pi.on("user_bash", async (_event, ctx) => {
@@ -1969,11 +1843,17 @@ export default function piGoal(pi: ExtensionAPI) {
     if (isValidTerminalUpdate(event, rt.goal) && rt.activeRun) {
       rt.terminalToolCallPending = { run: rt.activeRun, toolCallId: event.toolCallId };
     }
+    if (event.toolName === "compact" && rt.goal?.status === "active" && isRecord(event.input) && event.input.continueAfterCompaction !== true) {
+      // An active goal owns the next wake-up. pi-compactor intentionally does
+      // not send one when this flag is false, which would strand the goal
+      // after a successful compaction. Patch the mutable tool input rather
+      // than relying on a companion extension to know about goal ownership.
+      event.input.continueAfterCompaction = true;
+    }
     if (event.toolName === "workflow" && rt.goal?.status === "active" && (event.input as Record<string, unknown>).background !== false) {
       ctx.ui.notify("Background pi-workflows runs are blocked while a goal is active. Use background:false to avoid racing goal continuation.", "warning");
       return { block: true };
     }
-    if (rt.activeRun && event.toolName !== "get_goal") rt.activeRun.hadMeaningfulActivity = true;
     if (!isWorkspaceMutationTool(event, rt.goal)) return;
     await mutate(() => {
       const goal = rt.goal;
@@ -1987,6 +1867,7 @@ export default function piGoal(pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event: ToolExecutionEndEvent, _ctx) => {
+    if (rt.activeRun && event.toolName !== "get_goal" && !event.isError) rt.activeRun.hadMeaningfulActivity = true;
     if (event.toolName !== "compact" || event.isError || event.result?.terminate !== true) return;
     const run = rt.activeRun;
     const goal = rt.goal;
@@ -2115,6 +1996,7 @@ export default function piGoal(pi: ExtensionAPI) {
           if (goal.lastEvaluation?.verdict !== "achieved" || goal.lastEvaluation.revision !== goal.revision || !goal.lastEvaluation.evidence?.trim()) {
             throw new Error("Completion requires evaluate_goal to record achieved with non-empty evidence for the current revision.");
           }
+          rt.stopRun = rt.activeRun;
           advanceActivation();
           goal.status = "complete";
           goal.stopReason = "completion condition achieved";
@@ -2122,13 +2004,13 @@ export default function piGoal(pi: ExtensionAPI) {
           syncActiveTools();
           persistPatch(pi, goal);
           updateWidget(ctx);
-          rt.stopNextAgentStart = true;
           return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}\nUsage: ${formatUsage(goal)}` }], details: { goal: goalDetails(goal) }, terminate: true };
         }
 
         if (params.status !== "blocked") throw new Error("Model-facing update_goal only accepts complete or blocked; use /goal for pause, resume, clear, or limit changes.");
         const blocker = typeof params.blocker === "string" ? params.blocker.trim() : "";
         if (!blocker) throw new Error("blocker description required when status is blocked");
+        rt.stopRun = rt.activeRun;
         advanceActivation();
         goal.status = "blocked";
         goal.blocker = truncate(blocker);
@@ -2137,7 +2019,6 @@ export default function piGoal(pi: ExtensionAPI) {
         syncActiveTools();
         persistPatch(pi, goal);
         updateWidget(ctx);
-        rt.stopNextAgentStart = true;
         return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${goal.blocker}` }], details: { goal: goalDetails(goal) }, terminate: true };
       });
     },
@@ -2283,11 +2164,21 @@ export default function piGoal(pi: ExtensionAPI) {
     return /^(?:unlimited|none|off)$/i.test(raw) ? null : Number(raw);
   }
 
-  function parseOptions(input: string, defaults: { budget: number | null; maxTurns: number | null }): { objective: string; budget: number | null; maxTurns: number | null } {
+  interface ParsedOptions {
+    objective: string;
+    budget: number | null;
+    maxTurns: number | null;
+    budgetSpecified: boolean;
+    maxTurnsSpecified: boolean;
+  }
+
+  function parseOptions(input: string, defaults: { budget: number | null; maxTurns: number | null }): ParsedOptions {
     const tokens = input.trim().split(/\s+/).filter(Boolean);
     const remaining: string[] = [];
     let budget = defaults.budget;
     let maxTurns = defaults.maxTurns;
+    let budgetSpecified = false;
+    let maxTurnsSpecified = false;
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i]!;
       const match = token.match(/^--(?:budget|usd)(?:=(.+))?$/i);
@@ -2296,15 +2187,17 @@ export default function piGoal(pi: ExtensionAPI) {
         const raw = match[1] ?? tokens[++i];
         if (!raw) throw new Error("--budget requires a value");
         budget = parseLimit(raw);
+        budgetSpecified = true;
       } else if (turnsMatch) {
         const raw = turnsMatch[1] ?? tokens[++i];
         if (!raw) throw new Error("--max-turns requires a value");
         maxTurns = parseLimit(raw);
+        maxTurnsSpecified = true;
       } else {
         remaining.push(token);
       }
     }
-    return { objective: remaining.join(" "), budget, maxTurns };
+    return { objective: remaining.join(" "), budget, maxTurns, budgetSpecified, maxTurnsSpecified };
   }
 
   function statusMessage(): string {
@@ -2380,6 +2273,13 @@ export default function piGoal(pi: ExtensionAPI) {
           const recoveringStartup = initialGoal.status === "active" && rt.startupPending;
           if (!recoveringStartup && !["paused", "blocked", "budget_limited"].includes(initialGoal.status)) throw new Error(`Cannot resume a ${initialGoal.status} goal.`);
           if (spec.objective) throw new Error("/goal resume accepts only --budget and --max-turns options.");
+          // A limit that has already been reached is not useful as the
+          // default for resume. Lift it when the user did not explicitly
+          // provide a replacement, so `/goal resume` is a recovery action
+          // instead of an avoidable headroom error. Explicit limits remain
+          // hard policy and still fail validation when they lack headroom.
+          if (!spec.budgetSpecified && spec.budget !== null && spec.budget <= initialGoal.usage.cost) spec.budget = null;
+          if (!spec.maxTurnsSpecified && spec.maxTurns !== null && spec.maxTurns <= initialGoal.usage.turns) spec.maxTurns = null;
           validateResume(initialGoal, spec.budget, spec.maxTurns);
           await abortActiveRunForUserCommand(ctx);
           await mutate(() => {
@@ -2389,7 +2289,7 @@ export default function piGoal(pi: ExtensionAPI) {
             if (!currentRecoveringStartup && !["paused", "blocked", "budget_limited"].includes(goal.status)) throw new Error(`Cannot resume a ${goal.status} goal.`);
             const limits = validateResume(goal, spec.budget, spec.maxTurns);
             advanceActivation(true);
-            rt.stopNextAgentStart = false;
+            rt.stopRun = null;
             rt.startupPending = false;
             goal.budget = limits.budget;
             goal.maxTurns = limits.maxTurns;

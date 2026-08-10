@@ -162,6 +162,16 @@ describe("pi-goal extension", () => {
     expect(restoredGoal.maxTurns).toBeNull();
   });
 
+  test("the /goal command defaults both limits to unlimited", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getCommand("goal").handler("keep working until verified", ctx);
+    const state = (await pi.getTool("get_goal").execute("1", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.budget).toBeNull();
+    expect(state.maxTurns).toBeNull();
+  });
+
   test("rejects empty, non-positive, non-finite, and oversized inputs", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -245,6 +255,24 @@ describe("pi-goal extension", () => {
     const terminalCtx = createMockCtx(terminal.entries);
     terminal.handlers.get("session_start")({ type: "session_start", reason: "startup" }, terminalCtx);
     expect((await terminal.getTool("get_goal").execute("3", {}, undefined, undefined, terminalCtx)).content[0].text).toBe("No active goal.");
+
+    const unlimitedSource = createMockAPI();
+    extension(unlimitedSource as any);
+    const unlimitedCtx = createMockCtx(unlimitedSource.entries);
+    await unlimitedSource.getTool("create_goal").execute("4", { objective: "unlimited tightening" }, undefined, undefined, unlimitedCtx);
+    const unlimitedSnapshot = unlimitedSource.entries.at(-1).data;
+    const exhaustedTightening = {
+      schemaVersion: 1, kind: "patch", id: unlimitedSnapshot.id, sessionId: unlimitedSnapshot.sessionId,
+      status: "active", budget: 1, maxTurns: 1,
+      usage: { turns: 2, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 2 },
+      revision: unlimitedSnapshot.revision, updatedAt: unlimitedSnapshot.updatedAt, blocker: null, stopReason: null,
+      evaluationRequested: null, lastEvaluation: null,
+    };
+    const tightened = createMockAPI([...unlimitedSource.entries, { type: "custom", customType: "pi-goal/state", data: exhaustedTightening }]);
+    extension(tightened as any);
+    const tightenedCtx = createMockCtx(tightened.entries);
+    tightened.handlers.get("session_start")({ type: "session_start", reason: "startup" }, tightenedCtx);
+    expect((await tightened.getTool("get_goal").execute("5", {}, undefined, undefined, tightenedCtx)).content[0].text).toBe("No active goal.");
   });
 
   test("fails closed when malformed state follows a valid snapshot", async () => {
@@ -330,7 +358,7 @@ describe("pi-goal extension", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  test("tree reconstruction restores force-action identity before a queued user message", async () => {
+  test("tree reconstruction does not resurrect historical force markers", async () => {
     const source = createMockAPI();
     extension(source as any);
     const sourceCtx: any = createMockCtx(source.entries);
@@ -349,7 +377,7 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "tree force action" }] } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
-    expect(ctx.abort).toHaveBeenCalled();
+    expect(ctx.abort).not.toHaveBeenCalled();
   });
 
   test("tree navigation fences a streaming goal run before reconstruction", async () => {
@@ -506,7 +534,7 @@ describe("pi-goal extension", () => {
     expect(replacementCtx.abort).toHaveBeenCalledTimes(0);
   });
 
-  test("reload reconstructs force-action identity before the paired user message", async () => {
+  test("reload does not resurrect historical force markers", async () => {
     const source = createMockAPI();
     extension(source as any);
     const sourceCtx: any = createMockCtx(source.entries, "session-test");
@@ -526,7 +554,7 @@ describe("pi-goal extension", () => {
     replacement.handlers.get("agent_start")({ type: "agent_start" }, replacementCtx);
     replacement.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "reloaded force action" }] } }, replacementCtx);
     replacement.handlers.get("before_provider_request")({ type: "before_provider_request" }, replacementCtx);
-    expect(replacementCtx.abort).toHaveBeenCalled();
+    expect(replacementCtx.abort).not.toHaveBeenCalled();
   });
 
   test("does not restore a completed force-action pair after reload", async () => {
@@ -644,6 +672,23 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  test("active goals force compaction to request a recovery turn", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "compact must continue", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+
+    const input: Record<string, unknown> = { continueAfterCompaction: false };
+    await pi.handlers.get("tool_call")({
+      type: "tool_call",
+      toolCallId: "compact-continue",
+      toolName: "compact",
+      input,
+    }, ctx);
+    expect(input.continueAfterCompaction).toBe(true);
+  });
+
   test("terminating compact handoffs defer recovery to the compaction extension", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -680,7 +725,7 @@ describe("pi-goal extension", () => {
     await endRun(pi, ctx, [recovery]);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0].details.forceAction).toBe(true);
   });
 
   test("invalid lifecycle commands do not abort unrelated work", async () => {
@@ -701,6 +746,26 @@ describe("pi-goal extension", () => {
     ctx.isIdle.mockReturnValue(false);
     await pi.getCommand("goal").handler("pause", ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
+  test("accounts a provider turn completed while a lifecycle command fences it", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "account abort usage", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    ctx.isIdle.mockReturnValue(false);
+    ctx.waitForIdle = async () => {
+      await endTurn(pi, ctx, assistant(0.2), 0);
+      await endRun(pi, ctx, [{ ...assistant(0.2), stopReason: "aborted" }]);
+      ctx.isIdle.mockReturnValue(true);
+    };
+
+    await pi.getCommand("goal").handler("pause", ctx);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("paused");
+    expect(state.usage.turns).toBe(1);
+    expect(state.usage.cost).toBe(0.2);
   });
 
   test("pause remains successful when it aborts an active run", async () => {
@@ -1303,17 +1368,11 @@ describe("pi-goal extension", () => {
     await endTurn(pi, ctx, textOnly, 0);
     await endRun(pi, ctx, [textOnly]);
 
-    // The marker and actionable nudge are deferred until the old run settles;
-    // they must not create a no-op custom-message provider turn.
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    // The actionable nudge is a single lifecycle-observable custom turn;
+    // it must not rely on a fire-and-forget user-message wrapper.
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false });
+    expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ customType: "pi-goal/continuation", display: false, details: { forceAction: true } });
     expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous goal-owned provider turn returned prose without using a tool");
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0]?.[0]).toBe(pi.sendMessage.mock.calls[1]?.[0].content);
-    expect(pi.sendUserMessage.mock.calls[0]?.[1]).toBeUndefined();
   });
 
   test("preserves the forced-action continuation when delivery is deferred", async () => {
@@ -1338,9 +1397,8 @@ describe("pi-goal extension", () => {
     ctx.hasPendingMessages.mockReturnValue(false);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[1]?.[0]).toMatchObject({ details: { forceAction: true } });
     expect(pi.sendMessage.mock.calls[1]?.[0].content).toContain("previous goal-owned provider turn returned prose without using a tool");
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage.mock.calls[0]?.[1]).toBeUndefined();
   });
 
   test("force-action user nudges retain automatic ownership in one provider run", async () => {
@@ -1359,17 +1417,11 @@ describe("pi-goal extension", () => {
     const textOnly = assistant(0.1);
     await endTurn(pi, ctx, textOnly, 0);
     await endRun(pi, ctx, [textOnly]);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
-
-    // Settlement appends the hidden marker while idle, then starts one actual
-    // user-message run. The marker must not consume a separate provider turn.
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    // The force-action custom turn is queued directly after this run.
     const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
-    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
-    expect(typeof nudge).toBe("string");
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    expect(forceQueued.details.forceAction).toBe(true);
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
   });
@@ -1390,21 +1442,15 @@ describe("pi-goal extension", () => {
     const textOnly = assistant(0.1);
     await endTurn(pi, ctx, textOnly, 0);
     await endRun(pi, ctx, [textOnly]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const firstForce = pi.sendMessage.mock.calls[1]?.[0];
-    const firstNudge = pi.sendUserMessage.mock.calls[0]?.[0];
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstForce } }, ctx);
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: firstNudge }] } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstForce } }, ctx);
 
     const secondTextOnly = assistant(0.1);
     await endTurn(pi, ctx, secondTextOnly, 0);
     await endRun(pi, ctx, [secondTextOnly]);
-    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(3);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage.mock.calls[2]?.[0].details.forceAction).toBe(true);
   });
 
   test("blocks after repeated automatic no-progress turns", async () => {
@@ -1423,31 +1469,69 @@ describe("pi-goal extension", () => {
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...kickoff } }, ctx);
     await endTurn(pi, ctx, assistant(0.1), 0);
     await endRun(pi, ctx, [assistant(0.1)]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const firstForce = pi.sendMessage.mock.calls[1]?.[0];
-    const firstNudge = pi.sendUserMessage.mock.calls[0]?.[0];
 
     // Two more prose-only automatic turns must stop the loop instead of
     // producing an unbounded stream of identical nudges.
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...firstForce } }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: firstNudge }] } }, ctx);
     await endTurn(pi, ctx, assistant(0.1), 0);
     await endRun(pi, ctx, [assistant(0.1)]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const secondForce = pi.sendMessage.mock.calls[2]?.[0];
-    const secondNudge = pi.sendUserMessage.mock.calls[1]?.[0];
 
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...secondForce } }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: secondNudge }] } }, ctx);
     await endTurn(pi, ctx, assistant(0.1), 0);
     await endRun(pi, ctx, [assistant(0.1)]);
 
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
     expect(state.status).toBe("blocked");
     expect(state.stopReason).toContain("no-progress");
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  test("failed tool results count as no progress", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "bound failed tools", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const initial = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, initial, 0);
+    await endRun(pi, ctx, [initial]);
+    let continuation = pi.sendMessage.mock.calls[0]?.[0];
+
+    for (let turn = 0; turn < 3; turn++) {
+      pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+      pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
+      await pi.handlers.get("tool_call")({
+        type: "tool_call",
+        toolCallId: `failed-${turn}`,
+        toolName: "edit",
+        input: {},
+      }, ctx);
+      pi.handlers.get("tool_execution_end")({
+        type: "tool_execution_end",
+        toolCallId: `failed-${turn}`,
+        toolName: "edit",
+        result: { content: [{ type: "text", text: "failed" }] },
+        isError: true,
+      }, ctx);
+      const failed = assistant(0.1, 10, 5, 15, true);
+      await pi.handlers.get("turn_end")({
+        type: "turn_end",
+        turnIndex: 0,
+        message: failed,
+        toolResults: [{ role: "toolResult", toolName: "edit", isError: true, content: [] }],
+      }, ctx);
+      await endRun(pi, ctx, [failed]);
+      if (turn < 2) continuation = pi.sendMessage.mock.calls.at(-1)?.[0];
+    }
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toContain("no-progress");
   });
 
   test("unrelated extension user messages do not inherit stale nudge fencing", async () => {
@@ -1466,21 +1550,19 @@ describe("pi-goal extension", () => {
     const textOnly = assistant(0.1);
     await endTurn(pi, ctx, textOnly, 0);
     await endRun(pi, ctx, [textOnly]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
-    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
-    // The marker is appended before the extension-originated user prompt.
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    // A real user prompt may arrive while the extension's custom dispatch is
+    // queued; the stale marker must not abort that user-owned run.
     await pi.getCommand("goal").handler("clear", ctx);
     ctx.abort.mockClear();
-
+    pi.handlers.get("input")({ type: "input", text: "another extension follow-up", source: "interactive" }, ctx);
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
     pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "another extension follow-up" }] } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
 
     expect(ctx.abort).not.toHaveBeenCalled();
-    expect(nudge).toContain("previous goal-owned provider turn returned prose");
+    expect(forceQueued.content).toContain("previous goal-owned provider turn returned prose");
   });
 
   test("stale force-action user nudges are fenced after clear", async () => {
@@ -1499,16 +1581,13 @@ describe("pi-goal extension", () => {
     const textOnly = assistant(0.1);
     await endTurn(pi, ctx, textOnly, 0);
     await endRun(pi, ctx, [textOnly]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const forceQueued = pi.sendMessage.mock.calls[1]?.[0];
-    const nudge = pi.sendUserMessage.mock.calls[0]?.[0];
-    // Preserve the queued marker in the transcript, then clear before the
-    // paired user message is delivered.
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
+    // Clear before the queued custom marker is delivered. Its token must be
+    // fenced at the provider boundary rather than becoming unowned work.
     await pi.getCommand("goal").handler("clear", ctx);
 
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...forceQueued } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
     expect(ctx.abort).toHaveBeenCalled();
   });
@@ -1571,7 +1650,8 @@ describe("pi-goal extension", () => {
     await endRun(pi, ctx, [retried]);
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0]?.[0]).toMatchObject({ details: { forceAction: true } });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   test("reconstruction clears retry ownership from a prior runtime", async () => {
@@ -1679,7 +1759,7 @@ describe("pi-goal extension", () => {
     expect(state.details.goal.stopReason).toBe("turn limit reached");
   });
 
-  test("resume validation requires finite positive values and both kinds of headroom", async () => {
+  test("resume lifts reached defaults and accepts explicit headroom", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx = createMockCtx(pi.entries);
@@ -1688,20 +1768,38 @@ describe("pi-goal extension", () => {
     await endTurn(pi, ctx, assistant(1), 0);
     await endRun(pi, ctx, [assistant(1)]);
 
+    // A bare resume is a recovery action: reached caps are lifted rather
+    // than producing a second headroom error.
     await pi.getCommand("goal").handler("resume", ctx);
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("budget headroom"), "error");
-    await pi.getCommand("goal").handler("resume --budget 2", ctx);
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("max-turn headroom"), "error");
-    await pi.getCommand("goal").handler("resume --budget NaN --max-turns 2", ctx);
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("finite"), "error");
-    await pi.getCommand("goal").handler("resume --budget 2 --max-turns 2", ctx);
     expect(ctx.ui.notify).toHaveBeenLastCalledWith("Goal resumed.", "info");
-    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+    let state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(state.budget).toBeNull();
+    expect(state.maxTurns).toBeNull();
+
     await pi.getCommand("goal").handler("pause", ctx);
-    await pi.getCommand("goal").handler("resume --budget unlimited --max-turns unlimited", ctx);
-    const unlimited = (await pi.getTool("get_goal").execute("2b", {}, undefined, undefined, ctx)).details.goal;
-    expect(unlimited.budget).toBeNull();
-    expect(unlimited.maxTurns).toBeNull();
+    await pi.getCommand("goal").handler("resume --budget 2 --max-turns 2", ctx);
+    state = (await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(state.budget).toBe(2);
+    expect(state.maxTurns).toBe(2);
+
+    // An explicit stricter replacement is honored when current usage has
+    // headroom, rather than being silently widened back to the old caps.
+    await pi.getCommand("goal").handler("clear", ctx);
+    await pi.getTool("create_goal").execute("4", { objective: "stricter replacement", budget: 5, maxTurns: 5 }, undefined, undefined, ctx);
+    await pi.getCommand("goal").handler("pause", ctx);
+    await pi.getCommand("goal").handler("resume --budget 2 --max-turns 2", ctx);
+    state = (await pi.getTool("get_goal").execute("5", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.budget).toBe(2);
+    expect(state.maxTurns).toBe(2);
+    const restored = createMockAPI(pi.entries);
+    extension(restored as any);
+    const restoredCtx = createMockCtx(restored.entries);
+    restored.handlers.get("session_start")({ type: "session_start", reason: "startup" }, restoredCtx);
+    const restoredState = (await restored.getTool("get_goal").execute("6", {}, undefined, undefined, restoredCtx)).details.goal;
+    expect(restoredState.budget).toBe(2);
+    expect(restoredState.maxTurns).toBe(2);
   });
 
   test("requires fresh-context evaluation evidence and invalidates it on workspace mutation", async () => {
@@ -1759,6 +1857,27 @@ describe("pi-goal extension", () => {
       input: { agent: "reviewer", task: "read-only evaluation", cwd: nextNonce },
     }, ctx);
     expect((await pi.getTool("get_goal").execute("7", {}, undefined, undefined, ctx)).details.goal.evaluationRequested).toBeUndefined();
+  });
+
+  test("terminal fencing does not abort a later unrelated extension run", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "terminal fence scope", budget: 5 }, undefined, undefined, ctx);
+    const evaluate = pi.getTool("evaluate_goal");
+    await evaluate.execute("2", {}, undefined, undefined, ctx);
+    await evaluate.execute("3", { verdict: "achieved", reason: "verified", evidence: "clean" }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const update = await pi.getTool("update_goal").execute("terminal-1", { status: "complete" }, undefined, undefined, ctx);
+    expect(update.terminate).toBe(true);
+    await endRun(pi, ctx, [assistant(0)]);
+
+    // A subsequent extension-originated prompt must not inherit the old
+    // terminal stop fence.
+    pi.sendUserMessage("unrelated extension prompt");
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
   });
 
   test("fences sibling tool calls after a valid terminal update", async () => {
@@ -1832,14 +1951,11 @@ describe("pi-goal extension", () => {
     await endTurn(pi, ctx, first, 0);
     await endRun(pi, ctx, [first]);
     let continuation = pi.sendMessage.mock.calls[0]?.[0];
-    let nudge: string | undefined;
 
     for (let turn = 0; turn < 3; turn++) {
       pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
       pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
-      if (nudge !== undefined) {
-        pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: nudge }] } }, ctx);
-      }
+
       const blocked = await pi.handlers.get("tool_call")({
         type: "tool_call",
         toolCallId: `blocked-${turn}`,
@@ -1850,11 +1966,7 @@ describe("pi-goal extension", () => {
       const prose = assistant(0.1);
       await endTurn(pi, ctx, prose, 0);
       await endRun(pi, ctx, [prose]);
-      if (turn < 2) {
-        pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
-        continuation = pi.sendMessage.mock.calls.at(-1)?.[0];
-        nudge = pi.sendUserMessage.mock.calls.at(-1)?.[0];
-      }
+      if (turn < 2) continuation = pi.sendMessage.mock.calls.at(-1)?.[0];
     }
 
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
@@ -1862,11 +1974,32 @@ describe("pi-goal extension", () => {
     expect(state.stopReason).toContain("no-progress");
   });
 
-  test("blocks and releases a nudge when delivery fails", async () => {
+  test("blocks a normal continuation dispatch that receives no host acknowledgement", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx: any = createMockCtx(pi.entries);
-    await pi.getTool("create_goal").execute("1", { objective: "failed nudge", budget: 5 }, undefined, undefined, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "unacknowledged continuation", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    // The real ExtensionAPI returns void. No custom continuation message is
+    // observed because the host settled before starting the queued run.
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    await flushTimers();
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toBe("automatic continuation delivery failed");
+    expect(state.blocker).toContain("not acknowledged");
+  });
+
+  test("blocks a force-action continuation that receives no host acknowledgement", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "unacknowledged force action", budget: 5 }, undefined, undefined, ctx);
     await startRun(pi, ctx);
     const first = assistant(0, 10, 5, 15, true);
     await endTurn(pi, ctx, first, 0);
@@ -1878,9 +2011,37 @@ describe("pi-goal extension", () => {
     const prose = assistant(0.1);
     await endTurn(pi, ctx, prose, 0);
     await endRun(pi, ctx, [prose]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
 
-    pi.sendUserMessage.mockImplementationOnce(() => Promise.reject(new Error("provider preflight failed")));
+    // The real ExtensionAPI returns void. No message_start arrives before the
+    // host settles the failed custom dispatch.
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    await flushTimers();
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("blocked");
+    expect(state.stopReason).toBe("automatic continuation delivery failed");
+    expect(state.blocker).toContain("not acknowledged");
+  });
+
+  test("blocks and releases a force-action dispatch when delivery fails", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "failed force action", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const continuation = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...continuation } }, ctx);
+    const prose = assistant(0.1);
+    await endTurn(pi, ctx, prose, 0);
+    pi.sendMessage.mockImplementationOnce(() => Promise.reject(new Error("provider preflight failed")));
+    await endRun(pi, ctx, [prose]);
+    await Promise.resolve();
+    await Promise.resolve();
     await flushTimers();
 
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
@@ -1894,11 +2055,11 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(3);
   });
 
-  test("a real user prompt releases an attempted nudge reservation", async () => {
+  test("a real user prompt supersedes an attempted force-action dispatch", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx: any = createMockCtx(pi.entries);
-    await pi.getTool("create_goal").execute("1", { objective: "user recovers nudge", budget: 5 }, undefined, undefined, ctx);
+    await pi.getTool("create_goal").execute("1", { objective: "user recovers force action", budget: 5 }, undefined, undefined, ctx);
     await startRun(pi, ctx);
     const first = assistant(0, 10, 5, 15, true);
     await endTurn(pi, ctx, first, 0);
@@ -1910,11 +2071,10 @@ describe("pi-goal extension", () => {
     const prose = assistant(0.1);
     await endTurn(pi, ctx, prose, 0);
     await endRun(pi, ctx, [prose]);
-    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
 
-    // The mock does not start a provider run. A real user prompt must still
-    // release the attempted dispatch so its tool work can queue a continuation.
+    // Input activation fences the unacknowledged force dispatch, allowing
+    // user work to enqueue a fresh continuation instead of being suppressed.
     await startRun(pi, ctx);
     await pi.handlers.get("tool_call")({ type: "tool_call", toolCallId: "read-recovery", toolName: "read", input: {} }, ctx);
     const userWork = assistant(0.1, 10, 5, 15, true);
@@ -1924,6 +2084,31 @@ describe("pi-goal extension", () => {
 
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
     expect(state.status).toBe("active");
+  });
+
+  test("stale force follow-ups do not discard a newer user turn", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "fence stale force follow-up", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const initialContinuation = pi.sendMessage.mock.calls[0]?.[0];
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...initialContinuation } }, ctx);
+    const prose = assistant(0.1);
+    await endTurn(pi, ctx, prose, 0);
+    await endRun(pi, ctx, [prose]);
+    const queued = pi.sendMessage.mock.calls[1]?.[0];
+
+    // User steering wins first; the stale force marker arrives afterward in
+    // the same run and must be discarded without aborting the user request.
+    await startRun(pi, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
   });
 
   test("does not spin after a prose-only lifecycle", async () => {
