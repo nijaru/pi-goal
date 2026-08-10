@@ -1,5 +1,7 @@
 # pi-goal
 
+> **Development paused** — pi-goal is not actively maintained right now. Modern models make persistent session-scoped goals less necessary, and the package adds moving parts. The code remains available, but issues may go unanswered.
+
 Session-scoped autonomous goals for pi. Define a verifiable completion condition and pi continues working across turns until it is complete, paused, blocked, or bounded by usage.
 
 State lives in Pi session custom entries, so resume and `/tree` are branch-aware and forks remain independent. pi-goal never commits, resets, cleans, or runs model-supplied shell hooks.
