@@ -710,15 +710,15 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
     expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
 
-    // The companion compactor supplies the post-compaction user prompt. It
-    // must be able to bind that extension-originated message to the goal.
+    // The companion compactor supplies a hidden custom post-compaction
+    // prompt. It must bind that extension-originated message to the goal.
     pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
-    pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "Continue." }] } }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", customType: "pi-compactor-resume", content: "Continue." } }, ctx);
     pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
     expect(ctx.abort).not.toHaveBeenCalled();
 
     // Recovery is an automatic goal turn even though pi-compactor delivers it
-    // as a user-role message. A prose-only response must receive the same
+    // as a custom extension message. A prose-only response must receive the same
     // actionable follow-up as any other automatic turn.
     const recovery = assistant(0.1);
     await endTurn(pi, ctx, recovery, 0);
@@ -726,6 +726,164 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage.mock.calls[0]?.[0].details.forceAction).toBe(true);
+  });
+
+  test("recovers an orphaned goal run after built-in manual compaction", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "manual compaction recovery", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+
+    // AgentSession.compact disconnects agent events before aborting, so the
+    // goal run settles without an agent_end callback.
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    const signal = new AbortController().signal;
+    pi.handlers.get("session_before_compact")({
+      type: "session_before_compact",
+      preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 },
+      branchEntries: [],
+      reason: "manual",
+      willRetry: false,
+      signal,
+    }, ctx);
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(0.1) },
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    }, ctx);
+    await flushTimers();
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    const recovery = pi.sendMessage.mock.calls[0]?.[0];
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("context")({ type: "context", messages: [{ role: "custom", ...recovery }] }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...recovery } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
+  });
+
+  test("leaves a failed manual compaction resumable", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "failed manual compaction", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+
+    // A preparation failure can happen before session_before_compact. The
+    // orphaned run must be paused, not left active with no wake-up.
+    let state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("paused");
+    expect(state.stopReason).toBe("manual compaction in progress");
+    await pi.getCommand("goal").handler("resume", ctx);
+    state = (await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("leaves a cancelled manual compaction resumable", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "cancelled manual compaction", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const controller = new AbortController();
+    pi.handlers.get("session_before_compact")({
+      type: "session_before_compact",
+      preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 },
+      branchEntries: [],
+      reason: "manual",
+      willRetry: false,
+      signal: controller.signal,
+    }, ctx);
+    controller.abort();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("paused");
+    await pi.getCommand("goal").handler("resume", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("replaces an unacknowledged continuation during manual compaction", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "manual queued continuation", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    // Manual compaction can settle after agent_end but before the queued
+    // follow-up reaches message_start. Its deferred acknowledgement failure
+    // must yield to the compaction hook.
+    pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+
+    pi.handlers.get("session_before_compact")({
+      type: "session_before_compact",
+      preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 },
+      branchEntries: [],
+      reason: "manual",
+      willRetry: false,
+      signal: new AbortController().signal,
+    }, ctx);
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(0.1) },
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    }, ctx);
+    await flushTimers();
+
+    // The queued pre-compaction marker is fenced and replaced by exactly one
+    // post-compaction recovery dispatch.
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect((await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+  });
+
+  test("preserves queued continuations across threshold compaction", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "threshold compaction", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const first = assistant(0, 10, 5, 15, true);
+    await endTurn(pi, ctx, first, 0);
+    await endRun(pi, ctx, [first]);
+    const queued = pi.sendMessage.mock.calls[0]?.[0];
+
+    pi.handlers.get("session_before_compact")({
+      type: "session_before_compact",
+      preparation: { firstKeptEntryId: "entry-1", tokensBefore: 100 },
+      branchEntries: [],
+      reason: "threshold",
+      willRetry: false,
+      signal: new AbortController().signal,
+    }, ctx);
+    await pi.handlers.get("session_compact")({
+      type: "session_compact",
+      compactionEntry: { usage: providerUsage(0.1) },
+      fromExtension: false,
+      reason: "threshold",
+      willRetry: false,
+    }, ctx);
+    await flushTimers();
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    pi.handlers.get("context")({ type: "context", messages: [{ role: "custom", ...queued }] }, ctx);
+    pi.handlers.get("message_start")({ type: "message_start", message: { role: "custom", ...queued } }, ctx);
+    pi.handlers.get("before_provider_request")({ type: "before_provider_request" }, ctx);
+    expect(ctx.abort).not.toHaveBeenCalled();
   });
 
   test("invalid lifecycle commands do not abort unrelated work", async () => {

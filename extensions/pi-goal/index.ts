@@ -161,6 +161,11 @@ interface ActiveRun {
   hadMeaningfulActivity: boolean;
 }
 
+interface DeferredDispatchFailure {
+  dispatch: AutomaticDispatch;
+  ctx: ExtensionContext;
+}
+
 interface Runtime {
   goal: GoalState | null;
   activeRun: ActiveRun | null;
@@ -174,6 +179,9 @@ interface Runtime {
   pendingUserRun: { goalId: string | null; goalGeneration: number; activationId: string; activationEpoch: number } | null;
   pendingContinuation: { token: ContinuationRequest; forceAction: boolean } | null;
   compactionRecovery: ContinuationRequest | null;
+  manualCompactionCandidate: ContinuationRequest | null;
+  manualCompactionRecovery: ContinuationRequest | null;
+  deferredDispatchFailure: DeferredDispatchFailure | null;
   automaticDispatches: Map<string, AutomaticDispatch>;
   automaticRun: AutomaticDispatch | null;
   staleAutomaticRun: boolean;
@@ -789,6 +797,9 @@ export default function piGoal(pi: ExtensionAPI) {
     pendingUserRun: null,
     pendingContinuation: null,
     compactionRecovery: null,
+    manualCompactionCandidate: null,
+    manualCompactionRecovery: null,
+    deferredDispatchFailure: null,
     automaticDispatches: new Map(),
     automaticRun: null,
     staleAutomaticRun: false,
@@ -803,6 +814,22 @@ export default function piGoal(pi: ExtensionAPI) {
     nextDispatchId: 0,
   };
   let mutationQueue: Promise<unknown> = Promise.resolve();
+  let manualCompactionTimer: ReturnType<typeof setTimeout> | undefined;
+  let deferredDispatchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearManualCompactionTimer(): void {
+    if (manualCompactionTimer === undefined) return;
+    clearTimeout(manualCompactionTimer);
+    manualCompactionTimer = undefined;
+  }
+
+  function clearDeferredDispatchFailure(): void {
+    if (deferredDispatchTimer !== undefined) {
+      clearTimeout(deferredDispatchTimer);
+      deferredDispatchTimer = undefined;
+    }
+    rt.deferredDispatchFailure = null;
+  }
 
   function mutate<T>(task: () => T | PromiseLike<T>): Promise<T> {
     const next = mutationQueue.then(task, task);
@@ -821,6 +848,10 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.kickoff = null;
     rt.pendingContinuation = null;
     rt.compactionRecovery = null;
+    rt.manualCompactionCandidate = null;
+    rt.manualCompactionRecovery = null;
+    clearManualCompactionTimer();
+    clearDeferredDispatchFailure();
     // Dispatch identities belong to the fenced activation. Stale delivered
     // messages are still rejected by their embedded generation token, so the
     // map can be cleared here without losing the fence.
@@ -837,15 +868,24 @@ export default function piGoal(pi: ExtensionAPI) {
     return { goalId: goal.id, activationId: rt.activationId, activationEpoch: rt.activationEpoch };
   }
 
-  function matchesCurrentContinuation(token: ContinuationRequest): boolean {
-    return rt.goal?.status === "active"
-      && rt.goal.id === token.goalId
+  function matchesContinuationIdentity(token: ContinuationRequest): boolean {
+    return rt.goal?.id === token.goalId
       && rt.activationId === token.activationId
       && rt.activationEpoch === token.activationEpoch;
   }
 
+  function matchesCurrentContinuation(token: ContinuationRequest): boolean {
+    return rt.goal?.status === "active" && matchesContinuationIdentity(token);
+  }
+
   function hasAutomaticDispatch(token: ContinuationRequest): boolean {
     return [...rt.automaticDispatches.values()].some(dispatch => dispatch.goalId === token.goalId && dispatch.activationEpoch === token.activationEpoch);
+  }
+
+  function isCurrentGoalOwnedRun(run: ActiveRun | null, goal: GoalState): boolean {
+    if (!run) return false;
+    return (run.goalId === goal.id && run.goalGeneration === rt.goalGeneration && run.activationEpoch === rt.activationEpoch)
+      || (run.createdGoalId === goal.id && run.createdGoalEpoch === rt.activationEpoch);
   }
 
   function nextDispatchId(): string {
@@ -940,8 +980,7 @@ export default function piGoal(pi: ExtensionAPI) {
     updateWidget(ctx);
   }
 
-  function pauseGoal(goal: GoalState, stopReason: string, ctx: ExtensionContext): void {
-    advanceActivation();
+  function setGoalPaused(goal: GoalState, stopReason: string, ctx: ExtensionContext): void {
     goal.status = "paused";
     delete goal.blocker;
     goal.stopReason = truncate(stopReason);
@@ -949,6 +988,11 @@ export default function piGoal(pi: ExtensionAPI) {
     syncActiveTools();
     persistPatch(pi, goal);
     updateWidget(ctx);
+  }
+
+  function pauseGoal(goal: GoalState, stopReason: string, ctx: ExtensionContext): void {
+    advanceActivation();
+    setGoalPaused(goal, stopReason, ctx);
   }
 
   function finalAssistantStopReason(messages: any[]): string | undefined {
@@ -983,7 +1027,12 @@ export default function piGoal(pi: ExtensionAPI) {
       const owner = rt.settlementOwner;
       const ownerIsCurrent = !owner || (currentGoal?.id === owner.goalId && rt.goalGeneration === owner.goalGeneration);
       const goal = owner && !ownerIsCurrent ? owner.goal : currentGoal;
-      if (!goal || (!owner && goal.status !== "active")) return;
+      const manualRecoveryOwnsCurrent = !owner
+        && currentGoal !== null
+        && rt.manualCompactionRecovery !== null
+        && matchesContinuationIdentity(rt.manualCompactionRecovery)
+        && goal === currentGoal;
+      if (!goal || (!owner && goal.status !== "active" && !manualRecoveryOwnsCurrent)) return;
       recordProviderUsage(goal, providerUsage(usage));
       const limited = goal.status === "active" && markLimitIfNeeded(goal);
       persistPatch(pi, goal);
@@ -1031,10 +1080,48 @@ export default function piGoal(pi: ExtensionAPI) {
     }
   }
 
+  function scheduleManualCompactionRecovery(ctx: ExtensionContext): void {
+    const pending = rt.manualCompactionRecovery;
+    if (!pending || manualCompactionTimer !== undefined) return;
+    manualCompactionTimer = setTimeout(() => {
+      manualCompactionTimer = undefined;
+      void mutate(() => {
+        if (rt.manualCompactionRecovery !== pending || !matchesContinuationIdentity(pending)) {
+          if (rt.manualCompactionRecovery === pending) rt.manualCompactionRecovery = null;
+          return;
+        }
+        const goal = rt.goal;
+        rt.manualCompactionRecovery = null;
+        if (!goal || !["active", "paused"].includes(goal.status) || hasPendingUserWork(ctx)) return;
+        if (goal.status === "paused") {
+          goal.status = "active";
+          delete goal.blocker;
+          delete goal.stopReason;
+          touch(goal);
+          syncActiveTools();
+          persistPatch(pi, goal);
+          updateWidget(ctx);
+        }
+        if (markLimitIfNeeded(goal)) {
+          persistPatch(pi, goal);
+          updateWidget(ctx);
+          stopAfterLimit(goal, ctx);
+          return;
+        }
+        // Mark this as a compaction recovery before dispatching. A custom
+        // message started immediately after Pi reconnects otherwise has no
+        // before_agent_start hook to establish automatic goal ownership.
+        rt.compactionRecovery = pending;
+        sendContinuation(goal, ctx);
+      });
+    }, 0);
+  }
+
   function failAutomaticDispatch(dispatch: AutomaticDispatch, error: unknown, ctx: ExtensionContext): void {
     void mutate(() => {
       const registered = rt.automaticDispatches.get(dispatch.dispatchId);
       if (!registered || registered !== dispatch) return;
+      if (rt.deferredDispatchFailure?.dispatch === dispatch) clearDeferredDispatchFailure();
       rt.automaticDispatches.delete(dispatch.dispatchId);
       const goal = rt.goal;
       if (!goal || !matchesCurrentContinuation(dispatch)) return;
@@ -1339,6 +1426,7 @@ export default function piGoal(pi: ExtensionAPI) {
       }
       return false;
     }
+    if (rt.deferredDispatchFailure?.dispatch === dispatch) clearDeferredDispatchFailure();
     rt.automaticDispatches.delete(dispatchId);
     if (matchesCurrentContinuation(dispatch)) {
       rt.automaticRun = dispatch;
@@ -1382,7 +1470,7 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("input", event => {
     if (event.source !== "interactive" && event.source !== "rpc") return;
     const pendingForceDispatch = [...rt.automaticDispatches.values()].find(dispatch => dispatch.forceAction && matchesCurrentContinuation(dispatch));
-    if (pendingForceDispatch) advanceActivation();
+    if (pendingForceDispatch || rt.manualCompactionCandidate || rt.manualCompactionRecovery || rt.deferredDispatchFailure) advanceActivation();
     rt.compactionRecovery = null;
     rt.userInputQueued = true;
     rt.pendingUserRun = {
@@ -1734,10 +1822,20 @@ export default function piGoal(pi: ExtensionAPI) {
     if (continuationToken && matchesCurrentContinuation(continuationToken)) await queueContinuation(ctx, forceAction);
   });
 
-  function failUnacknowledgedAutomaticDispatch(ctx: ExtensionContext): boolean {
+  function deferUnacknowledgedAutomaticDispatch(ctx: ExtensionContext): boolean {
     for (const dispatch of rt.automaticDispatches.values()) {
       if (!matchesCurrentContinuation(dispatch)) continue;
-      failAutomaticDispatch(dispatch, new Error("prompt dispatch was not acknowledged"), ctx);
+      if (rt.deferredDispatchFailure?.dispatch === dispatch) return true;
+      rt.deferredDispatchFailure = { dispatch, ctx };
+      deferredDispatchTimer = setTimeout(() => {
+        deferredDispatchTimer = undefined;
+        const pending = rt.deferredDispatchFailure;
+        rt.deferredDispatchFailure = null;
+        if (!pending || pending.dispatch !== dispatch) return;
+        const registered = rt.automaticDispatches.get(dispatch.dispatchId);
+        if (!registered || registered !== dispatch) return;
+        failAutomaticDispatch(dispatch, new Error("prompt dispatch was not acknowledged"), pending.ctx);
+      }, 0);
       return true;
     }
     return false;
@@ -1746,7 +1844,20 @@ export default function piGoal(pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     const failure = rt.retryFailure;
     const goal = rt.goal;
-    const ownsCurrentGoal = failure !== null
+    const orphanedRun = rt.activeRun;
+    const orphanedGoalRun = goal?.status === "active" && isCurrentGoalOwnedRun(orphanedRun, goal);
+    if (orphanedGoalRun && goal) {
+      // Built-in manual compaction disconnects Pi's agent event stream before
+      // aborting the run. The normal agent_end hook is therefore skipped, but
+      // agent_settled still arrives with the old activeRun. Quarantine that
+      // ownership until session_before_compact can claim a recovery token.
+      pauseGoal(goal, "manual compaction in progress", ctx);
+      rt.activeRun = null;
+      rt.manualCompactionCandidate = currentContinuation(goal);
+    }
+    const manualCompactionCandidate = rt.manualCompactionCandidate !== null;
+    const ownsCurrentGoal = !manualCompactionCandidate
+      && failure !== null
       && goal?.status === "active"
       && goal.id === failure.goalId
       && rt.goalGeneration === failure.goalGeneration
@@ -1768,7 +1879,10 @@ export default function piGoal(pi: ExtensionAPI) {
     rt.settlementOwner = null;
     rt.retryOwner = null;
     rt.retryCreatedGoal = null;
-    if (failUnacknowledgedAutomaticDispatch(ctx)) return;
+    // Manual compaction owns the next wake-up. Do not fail a custom dispatch
+    // while Pi is disconnecting and rebuilding the context.
+    if (manualCompactionCandidate) return;
+    if (deferUnacknowledgedAutomaticDispatch(ctx)) return;
     const kickoff = rt.kickoff;
     if (!kickoff) {
       // Keep a dispatch registered until message_start consumes it. A
@@ -1909,18 +2023,45 @@ export default function piGoal(pi: ExtensionAPI) {
     run.compactionHandoff = true;
   });
 
-  pi.on("session_before_compact", (_event, _ctx) => {
+  pi.on("session_before_compact", (event, ctx) => {
     const goal = rt.goal;
     if (!goal) return undefined;
+    if (event.reason === "manual" && !rt.compactionRecovery && !rt.manualCompactionRecovery) {
+      const token = currentContinuation(goal);
+      const candidate = rt.manualCompactionCandidate;
+      const candidateMatches = candidate !== null && matchesContinuationIdentity(candidate);
+      const activeGoalRun = goal.status === "active" && isCurrentGoalOwnedRun(rt.activeRun, goal);
+      const pendingDispatch = goal.status === "active" && hasAutomaticDispatch(token);
+      // Built-in manual compaction disconnects agent events before aborting;
+      // preserve one recovery even when the normal agent_end continuation was
+      // never observed. A pi-compactor terminate handoff already owns its
+      // recovery through rt.compactionRecovery and must not be duplicated.
+      if ((candidateMatches || activeGoalRun || pendingDispatch) && (goal.status === "active" || candidateMatches)) {
+        advanceActivation();
+        rt.activeRun = null;
+        if (goal.status === "active") setGoalPaused(goal, "manual compaction in progress", ctx);
+        rt.manualCompactionRecovery = currentContinuation(goal);
+        event.signal?.addEventListener("abort", () => {
+          void mutate(() => {
+            if (!rt.manualCompactionRecovery) return;
+            if (matchesContinuationIdentity(rt.manualCompactionRecovery)) rt.manualCompactionRecovery = null;
+          });
+        }, { once: true });
+      }
+    }
     // Follow-up continuations are queued inside the agent lifecycle, so Pi
-    // checks automatic compaction before draining them. This hook only writes
-    // a compact state snapshot and never replaces Pi's normal summary.
+    // checks automatic compaction before draining them. This hook snapshots
+    // state and claims only built-in manual-compaction recovery; threshold,
+    // overflow, and pi-compactor handoffs retain their owning lifecycle.
     persist(pi, goal);
     return undefined;
   });
 
   pi.on("session_compact", async (event: SessionCompactEvent, ctx) => {
     await accountAuxiliaryUsage(event.compactionEntry.usage, ctx);
+    if (event.reason !== "manual") return;
+    if (!rt.manualCompactionRecovery || !matchesContinuationIdentity(rt.manualCompactionRecovery)) return;
+    scheduleManualCompactionRecovery(ctx);
   });
 
   const renderText = (result: any) => new Text(result.content?.[0]?.type === "text" ? result.content[0].text : "", 0, 0);
