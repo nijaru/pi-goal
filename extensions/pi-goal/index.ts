@@ -940,6 +940,17 @@ export default function piGoal(pi: ExtensionAPI) {
     updateWidget(ctx);
   }
 
+  function pauseGoal(goal: GoalState, stopReason: string, ctx: ExtensionContext): void {
+    advanceActivation();
+    goal.status = "paused";
+    delete goal.blocker;
+    goal.stopReason = truncate(stopReason);
+    touch(goal);
+    syncActiveTools();
+    persistPatch(pi, goal);
+    updateWidget(ctx);
+  }
+
   function finalAssistantStopReason(messages: any[]): string | undefined {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]?.role === "assistant") return messages[i].stopReason;
@@ -956,6 +967,13 @@ export default function piGoal(pi: ExtensionAPI) {
         : undefined;
     }
     return undefined;
+  }
+
+  function isAbortLikeProviderError(message: string | undefined): boolean {
+    if (!message) return false;
+    const normalized = message.trim().toLowerCase().replace(/^(?:aborterror|error):\s*/, "").replace(/\s+/g, " ").replace(/[.!]+$/, "");
+    return /^(?:(?:this|the) )?(?:operation|request) was (?:aborted|cancelled|canceled)$/.test(normalized)
+      || /^(?:aborted|cancelled|canceled) by (?:the )?user$/.test(normalized);
   }
 
   function accountAuxiliaryUsage(usage: Usage | undefined, ctx: ExtensionContext): Promise<void> {
@@ -1598,9 +1616,14 @@ export default function piGoal(pi: ExtensionAPI) {
       if (rt.terminalToolCallPending?.run === run) rt.terminalToolCallPending = null;
       const goal = rt.goal;
       const finalStopReason = finalAssistantStopReason(event.messages);
-      const interrupted = finalStopReason === "aborted";
+      const failureReason = finalAssistantError(event.messages) ?? "Provider request failed before the goal could continue.";
       const failed = finalStopReason === "error";
-      const failureReason = finalAssistantError(event.messages) ?? "Provider retries were exhausted after an error.";
+      // Pi normally normalizes an interrupted provider call to stopReason
+      // "aborted". Some transports instead preserve an abort-shaped error;
+      // the active run signal is authoritative when available, with a narrow
+      // message fallback for transports that lose that signal at the boundary.
+      const interrupted = finalStopReason === "aborted"
+        || (failed && (ctx.signal?.aborted === true || isAbortLikeProviderError(failureReason)));
 
       // Only a goal created by a tool in this run may claim an otherwise
       // unrelated run. A user turn must not inherit a goal that was resumed
@@ -1729,12 +1752,16 @@ export default function piGoal(pi: ExtensionAPI) {
       && rt.goalGeneration === failure.goalGeneration
       && rt.activationEpoch === failure.activationEpoch;
     if (ownsCurrentGoal && goal) {
-      blockGoal(goal, failure.reason, "provider retries exhausted after an error", ctx);
+      // Pi exposes agent_settled after both genuine retry exhaustion and a
+      // user-cancelled retry backoff, but the extension API does not expose
+      // which outcome occurred. Keep the goal resumable and avoid claiming
+      // exhaustion when cancellation may have caused settlement.
+      pauseGoal(goal, failure.reason, ctx);
       rt.retryFailure = null;
       rt.settlementOwner = null;
       rt.retryOwner = null;
       rt.retryCreatedGoal = null;
-      ctx.ui.notify("Goal blocked after provider retries were exhausted. Use /goal resume when the provider is available.", "warning");
+      ctx.ui.notify("Goal paused after a provider error. Use /goal resume to try again.", "warning");
       return;
     }
     rt.retryFailure = null;

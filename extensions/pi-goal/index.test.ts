@@ -1256,7 +1256,7 @@ describe("pi-goal extension", () => {
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  test("blocks a goal when provider retries finally fail", async () => {
+  test("pauses an unresolved provider failure at settlement", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx = createMockCtx(pi.entries);
@@ -1268,9 +1268,28 @@ describe("pi-goal extension", () => {
     pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
 
     const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
-    expect(state.status).toBe("blocked");
-    expect(state.blocker).toContain("provider unavailable");
-    expect(state.stopReason).toContain("provider retries exhausted");
+    expect(state.status).toBe("paused");
+    expect(state.blocker).toBeUndefined();
+    expect(state.stopReason).toBe("provider unavailable");
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Goal paused after a provider error. Use /goal resume to try again.", "warning");
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("treats an abort-shaped provider error as user interruption", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx: any = createMockCtx(pi.entries);
+    ctx.signal = AbortSignal.abort();
+    await pi.getTool("create_goal").execute("1", { objective: "abort-shaped provider error", budget: 5 }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    const failed = { ...assistant(0.1), stopReason: "error", errorMessage: "This operation was aborted" };
+    await endTurn(pi, ctx, failed, 0);
+    await endRun(pi, ctx, [failed]);
+
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("paused");
+    expect(state.stopReason).toBe("interrupted by the user");
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Goal paused after interruption. Use /goal resume to continue.", "info");
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
