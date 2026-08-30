@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "kf83",
+  "title": "Define goal domain events and pure reducer",
+  "description": "Create discriminated GoalState and GoalEvent types plus pure reducer transitions for lifecycle, usage, progress, continuation, and evaluation. Acceptance: no Pi imports; reducer tests cover valid transitions and rejected stale transitions.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "domain"
+  ],
+  "assignees": null,
+  "parent": "pi-goal-8pc3",
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:03:39.742743Z",
+      "msg": "Implemented extensions/pi-goal/domain.ts with pure GoalEvent reducer, run leases, progress policy, independent usage/time limits, evaluation claims, and stale transition rejection. Tests: domain.test.ts."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:32.492962Z",
+  "updated_at": "2026-08-30T05:03:39.753776Z",
+  "completed_at": "2026-08-30T05:03:39.753776Z",
+  "external": {}
+}

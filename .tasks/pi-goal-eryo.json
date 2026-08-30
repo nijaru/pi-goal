@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "eryo",
+  "title": "Implement serialized run-lease controller",
+  "description": "Own provider runs, continuation dispatch, retries, cancellation, reload, tree, compaction, and shutdown through explicit run leases and one serialized controller queue. Acceptance: stale events cannot charge, continue, or abort a replacement run; lifecycle fault tests pass.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "lifecycle"
+  ],
+  "assignees": null,
+  "parent": "pi-goal-8pc3",
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:03:39.782128Z",
+      "msg": "Implemented extensions/pi-goal/controller.ts with one serialized mutation queue, explicit continuation leases, dispatch acknowledgement/supersession/timeout, and lifecycle effect ownership. Tests: controller.test.ts and index lifecycle cases."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:32.520776Z",
+  "updated_at": "2026-08-30T05:03:39.791931Z",
+  "completed_at": "2026-08-30T05:03:39.791931Z",
+  "external": {}
+}

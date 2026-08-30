@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "fb8a",
+  "title": "Rewrite lifecycle and persistence test suite",
+  "description": "Replace legacy implementation tests with reducer property-like cases, lifecycle fault matrix, restart/tree/fork/compaction coverage, and end-to-end mock adapter tests. Acceptance: deterministic full suite passes.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "tests"
+  ],
+  "assignees": null,
+  "parent": "pi-goal-8pc3",
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:03:39.842156Z",
+      "msg": "Replaced the 2,400-line legacy suite with 21 focused reducer/store/controller/adapter tests and 50 expectations. Full bun test passes."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:32.558092Z",
+  "updated_at": "2026-08-30T05:03:39.851948Z",
+  "completed_at": "2026-08-30T05:03:39.851948Z",
+  "external": {}
+}

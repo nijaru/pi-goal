@@ -1,0 +1,31 @@
+{
+  "project": "pi-goal",
+  "ref": "8pc3",
+  "title": "Fully redesign pi-goal around reducer and run-lease controller",
+  "description": "Replace the monolithic lifecycle extension with a pure goal state reducer, branch-aware event store, serialized runtime controller, explicit progress checkpoints, and evidence-bound completion. Compatibility with the existing implementation is not required. Definition of done: all tasks complete, full tests pass, typecheck and diff checks pass, and README/skill/context describe the new model.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "architecture"
+  ],
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T04:36:20.500087Z",
+      "msg": "User explicitly removed compatibility constraint and requested a ground-up redesign. Current implementation is monolithic (~2500 lines) with implicit lifecycle ownership; target is reducer + event store + run-lease controller."
+    },
+    {
+      "ts": "2026-08-30T05:22:10.050006Z",
+      "msg": "Independent review fixes applied: restart/tree/shutdown now end and pause persisted runs; execution deadlines abort at maxExecutionSeconds; reducer/store enforce evidence-gated completion; pending continuations carry revision and are cleared on activity/compaction invalidation; turn IDs retain bounded event-history coverage. Added regression tests. Verification: bun test 27 passed / 59 expectations, bunx tsc --noEmit, git diff --check."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:17.252079Z",
+  "updated_at": "2026-08-30T05:22:10.068315Z",
+  "completed_at": "2026-08-30T05:22:10.068315Z",
+  "external": {}
+}

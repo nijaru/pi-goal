@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "eld0",
+  "title": "Rebuild goal tools commands and UI",
+  "description": "Expose the new objective/doneWhen/limits/checkpoint/evaluation model through Pi tools and user commands without compatibility shims. Acceptance: API contracts and status output reflect structured state and lifecycle ownership.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "api"
+  ],
+  "assignees": null,
+  "parent": "pi-goal-8pc3",
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:03:39.822202Z",
+      "msg": "Rebuilt extensions/pi-goal/index.ts tools, commands, UI, lifecycle adapter, completion gate, compaction/restart/tree handling, and execution-time limits with no compatibility shims."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:32.548068Z",
+  "updated_at": "2026-08-30T05:03:39.831869Z",
+  "completed_at": "2026-08-30T05:03:39.831869Z",
+  "external": {}
+}

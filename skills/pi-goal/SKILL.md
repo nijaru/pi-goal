@@ -1,51 +1,66 @@
 ---
 name: pi-goal
 description: >
-  Session-scoped persistent goals for pi. Define what "done" means, and the
-  agent works until it is complete, paused, blocked, or bounded.
-version: 0.3.0
+  Session-scoped autonomous goals for pi. Define an objective and a verifiable
+  definition of done; the supervisor drives concrete progress cycles.
+version: 0.4.0
 ---
 
 # pi-goal
 
-Use this continuation loop for long-running work with a concrete, verifiable finish line. Limits are optional; use a normal prompt for one-shot tasks.
+Use this loop for work with a concrete finish line. A goal must have an
+objective and a definition of done. The supervisor drives one provider run at a
+time and persists typed events in the current Pi session branch.
 
 ## Commands
 
 - `/goal` — show status
-- `/goal <objective>` — create and start with unlimited USD and turns
-- `/goal --budget N --max-turns N <objective>` — create with explicit hard limits; either option may be used alone (`unlimited` removes one)
-- `/goal edit <objective>` — replace the current goal
+- `/goal <objective>` — create and start with a default definition of done
 - `/goal pause` — pause
-- `/goal resume [--budget N|unlimited] [--max-turns N|unlimited]` — resume a paused, blocked, or limited goal; a reached limit is lifted when no replacement is supplied
-- `/goal clear` — clear and persist a tombstone
-
-Pause, resume, clear, and budget/maxTurns changes are user-command-only.
+- `/goal resume` — resume a paused or blocked goal; create a replacement after a limit stop
+- `/goal clear` — clear
 
 ## Tools
 
-- `create_goal` — create a session-scoped goal; optional `budget` and `maxTurns` are hard bounds, omitted limits are unlimited
-- `get_goal` — inspect state, provider usage, execution time, evaluation, blocker, and progress
-- `update_goal` — mark only `complete` or `blocked`; it cannot pause, resume, clear, or change limits
-- `evaluate_goal` — request an adversarial evaluation prompt, then record `achieved`, `not_yet`, or `error`
-- `log_iteration` — record a bounded logical attempt and evidence
-- `log_idea` — record a bounded idea
+- `create_goal` — create or replace a goal; provide `objective`, `doneWhen`, and optional `maxCost`, `maxTurns`, or `maxExecutionSeconds`
+- `get_goal` — inspect structured state, usage, limits, progress, and evaluation
+- `goal_checkpoint` — record action, observation, progress (`made`, `blocked`, or `none`), and evidence
+- `evaluate_goal` — request or record an independent evaluation
+- `update_goal` — mark only `complete` or `blocked`
 
-`create_goal` remains visible for explicit user requests. `get_goal`, `update_goal`, `evaluate_goal`, `log_iteration`, and `log_idea` are dynamically hidden unless a goal is active; runtime guards still reject invalid direct calls.
+Only `create_goal` is visible without an active goal. Runtime guards remain in
+place for all other tools.
 
 ## Operating rules
 
-1. Use one objective with a measurable stopping condition and verification surface.
-2. Call `log_iteration` after meaningful attempts and include command/test output.
-3. Before completion, request `evaluate_goal` with no verdict. The caller must give its prompt to a genuinely fresh, read-only evaluator (the `subagent` handoff is supported while evaluation is pending), record that evaluator's verdict and non-empty evidence, then call `update_goal` with `complete` only if it says `achieved` for the current revision. Any other workspace-mutating tool activity invalidates the request; evaluator independence remains caller-enforced.
-4. Use `blocked` when user input or an external dependency is required; include the concrete blocker. An unresolved provider error pauses the goal because Pi's extension API cannot distinguish retry exhaustion from a user-cancelled retry backoff. Three consecutive automatic turns without meaningful tool activity still block the loop; resume after correcting the provider or choosing a new step.
-5. Usage is scoped to the goal active at `agent_start` and accounted once per `turn_end`. `timeUsedSeconds` records whole seconds spent in goal-owned provider runs; paused, reloaded, and idle periods are excluded. Omitted limits are unlimited. An explicit USD threshold is post-provider-call, so one call may overshoot; an explicit `maxTurns` aborts before another turn. `/goal resume` lifts a reached limit when no replacement is supplied; explicit replacements still require headroom. Pi's local budget is optional policy, not a replacement for provider or ChatGPT-plan quotas.
-6. Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate a recorded evaluation. `evaluate_goal` followed by `update_goal complete` does not.
-7. While a goal is active, invoke pi-workflows only with `background: false`; detached/background workflows are blocked to prevent continuation races.
-8. `kept` and `reverted` are logical labels. pi-goal never mutates Git or runs arbitrary shell hooks.
+1. Use one objective with a measurable `doneWhen` condition.
+2. Work in explicit cycles: inspect, take one concrete action, observe the
+   result, then call `goal_checkpoint` with real evidence.
+3. Classify progress honestly. Failed tools and prose-only responses are not
+   progress. Repeated no-progress or blocked checkpoints stop the loop with a
+   diagnostic instead of spinning forever.
+4. Before completion, call `evaluate_goal` without a verdict. Give its prompt to
+   a genuinely fresh, read-only evaluator, then record that evaluator's verdict
+   and evidence. Call `update_goal` with `complete` only for an achieved result
+   bound to the current request, revision, and activity epoch.
+5. Use `update_goal` with `blocked` when user input or an external dependency is
+   required. Include the concrete blocker. Pause, resume, clear, replacement,
+   and limit policy are user-command-only. A limit stop requires a replacement
+   goal with revised limits.
+6. Usage is attributed to the run lease active at provider dispatch. Parent
+   turns, nested usage, and execution time are accounted idempotently. Explicit
+   cost, turn, and execution-time limits are local stop conditions; provider
+   account or plan quotas still apply.
+7. Never mutate Git, run arbitrary shell hooks, or invoke detached/background
+   workflows from an active goal.
 
-## Lifecycle
+## Runtime and persistence
 
-`active` → `complete` | `blocked` | `budget_limited` (only when an explicit limit is reached) | `paused` | `cleared`; unresolved provider errors use `paused`, while repeated no-progress turns use `blocked`.
+The implementation uses a pure goal reducer, typed events, and one serialized
+run-lease controller. Every provider-bound effect checks its lease; stale
+lifecycle events cannot charge, continue, or abort a replacement run.
 
-Goals are persisted as Pi session custom entries and reconstructed from the current branch. A restored active goal waits for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstructs the selected state but does not schedule work before the selected prompt is resubmitted, and invalidates prior evaluation evidence. Compaction keeps Pi's normal summary. Kickoffs and normal continuations use hidden, attributed custom messages queued through Pi's retry and compaction-safe lifecycle. Threshold and overflow compaction retain that queue; built-in manual compaction fences a disconnected goal run and schedules one recovery after successful compaction. A failed or cancelled manual compaction leaves the goal paused for `/goal resume`. A terminating `compact` tool handoff is excluded from that normal continuation path; the compaction extension owns the recovery prompt after Pi reaches idle. If a goal-owned provider turn returns prose or failed tool calls without meaningful progress, pi-goal queues one lifecycle-fenced custom continuation whose prompt explicitly requires a concrete tool step; this keeps dispatch, retries, compaction, and stale-message fencing on Pi's observable lifecycle instead of relying on an unobservable extension user-message call.
+Pi's selected session branch is the durable authority. Compaction writes a
+reducer snapshot. Restart reconstructs state but does not start work until user
+input or `/goal resume`; forks clear inherited goals. The current schema and
+API are intentionally new and do not migrate the former state or patch format.

@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "v7pt",
+  "title": "Implement branch-aware event store",
+  "description": "Persist typed goal events in Pi custom entries and reconstruct selected branch through the reducer. Add bounded validation and compact snapshot support only if needed. Acceptance: replay, corruption, branch, restart, and duplicate-event tests pass.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "rewrite",
+    "persistence"
+  ],
+  "assignees": null,
+  "parent": "pi-goal-8pc3",
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:03:39.763364Z",
+      "msg": "Implemented extensions/pi-goal/store.ts with typed pi-goal/event replay, snapshot checkpoints, event ID deduplication, branch selection, and bounded validation. Tests: store.test.ts."
+    }
+  ],
+  "created_at": "2026-08-30T04:36:32.510303Z",
+  "updated_at": "2026-08-30T05:03:39.773531Z",
+  "completed_at": "2026-08-30T05:03:39.773531Z",
+  "external": {}
+}

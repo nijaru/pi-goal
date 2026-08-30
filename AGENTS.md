@@ -1,20 +1,29 @@
 # pi-goal
 
-Persistent goal loop for pi. Define what "done" means; the agent works until it is complete, paused, blocked, or an explicitly configured limit is reached.
+Session-scoped autonomous goals for Pi. Define an objective and an explicit,
+verifiable definition of done; the supervisor drives concrete work cycles until
+completion, pause, block, limit, or clear.
 
 ## Architecture
 
-- Single extension entry: `extensions/pi-goal/index.ts`
-- Canonical state: Pi session custom entries via `pi.appendEntry("pi-goal/state", ...)`
-- Goal scope: current Pi session branch; reconstruction is branch-aware and forks intentionally start independently to avoid cross-session goal races
+- Entry point: `extensions/pi-goal/index.ts`
+- Domain reducer: `extensions/pi-goal/domain.ts`
+- Branch event store: `extensions/pi-goal/store.ts`
+- Serialized controller: `extensions/pi-goal/controller.ts`
+- Canonical state: typed `pi-goal/event` entries in the selected Pi session branch
+- Compaction checkpoint: typed `pi-goal/snapshot` entry
+- Runtime ownership: explicit run leases; never a durable authority
 
 ## Scope
 
-- Goals default to unlimited USD and turns; explicit user-provided limits remain hard bounds
+- Goal creation requires `objective` and `doneWhen`; optional hard limits are USD cost, provider turns, and active execution seconds
+- `goal_checkpoint` owns inspect/action/observation/progress evidence; repeated no-progress or blocked cycles stop the loop
+- Completion requires a fresh read-only evaluation bound to the current revision, activity epoch, and request ID
 - No orchestration: that belongs to pi-workflows
 - No agent definitions: that belongs to pi-subagents
-- No destructive Git automation or arbitrary model-supplied shell hooks
-- Model-facing `update_goal` only accepts `complete` and `blocked`; user commands own pause, resume, clear, and limit changes
+- No destructive Git automation, arbitrary model-supplied shell hooks, or detached/background workflow work
+- Model-facing `update_goal` accepts only `complete` and `blocked`; user commands own pause, resume, clear, and replacement. A limit stop requires a replacement with revised limits
+- Compatibility with the former schema, patch protocol, and project-global `.pi/goal` state is intentionally not supported
 
 ## Stack and tests
 
@@ -33,24 +42,22 @@ git diff --check
 
 | Tool | Key params | Notes |
 |------|-----------|-------|
-| `create_goal` | `objective`, optional `budget`, optional `maxTurns` | Omitted limits are unlimited; fails if a nonterminal goal exists |
-| `get_goal` | (none) | Read-only state and usage |
-| `update_goal` | `status: complete\|blocked`, `blocker?` | Completion requires current-revision evaluation with evidence |
-| `evaluate_goal` | `verdict?`, `reason?`, `evidence?` | Caller supplies fresh context; achieved requires non-empty evidence |
-| `log_iteration` | `hypothesis`, `result`, `status`, `cost?`, `evidence?` | Logical kept/reverted labels only; no Git changes |
-| `log_idea` | `idea` | Session-persisted bounded backlog |
+| `create_goal` | `objective`, `doneWhen`, optional `maxCost`, `maxTurns`, `maxExecutionSeconds` | Creates or replaces the current goal |
+| `get_goal` | (none) | Read-only structured state, limits, usage, progress, and evaluation |
+| `goal_checkpoint` | `action`, `observation`, `progress`, `evidence` | Required cycle evidence; progress is `made`, `blocked`, or `none` |
+| `evaluate_goal` | `requestId?`, `verdict?`, `reason?`, `evidence?` | Caller supplies a fresh evaluator; achieved requires evidence |
+| `update_goal` | `status: complete\|blocked`, `blocker?` | Completion requires the exact achieved evaluation |
 
-Statuses: `active` → `complete` | `blocked` | `budget_limited` | `paused` | `cleared`.
+Statuses: `active` → `complete` | `blocked` | `limited` | `paused` | `cleared`; only paused or blocked goals resume in place.
 
 ## Design rules
 
-- Mutating tool operations and usage/accounting updates run through one async queue; lifecycle callbacks fence run ownership before they schedule or account work.
-- Attribute usage to the owning goal generation; account one parent provider response per `turn_end`, persist every turn, check each explicitly configured USD limit after the call, and abort before another turn at an explicitly configured `maxTurns`.
-- A single provider call may overshoot an explicit USD budget. Resuming paused, blocked, or limited goals requires headroom only for a reached limit; command paths share centralized finite/positive/bounds validation.
-- State is validated and bounded during reconstruction. The newest state entry is authoritative, and clear/replacement tombstones prevent stale resurrection.
-- Prompt-injected objective/evidence/notes are bounded, escaped against embedded data-block markers, and clearly marked as untrusted data.
-- Compaction adds a goal snapshot without replacing Pi's normal summary. Automatic continuations use Pi's agent-lifecycle queue, allowing Pi's auto-compaction check to finish before follow-ups are drained.
-- Restored active goals wait for the next user prompt or explicit `/goal resume` before starting, avoiding a race with Pi's initial prompt. `/tree` reconstruction does not schedule work before a prompt is submitted in the selected branch. Explicit kickoffs and normal lifecycle continuations use hidden, attributed custom messages; goal-owned provider turns that end in prose without a tool wait for settlement, then append the hidden marker and start one paired, lifecycle-fenced user-role follow-up because the extension API lacks Pi's internal developer-context path.
-- Workspace-mutating tool activity, `user_bash`, session restart, and `/tree` reconstruction invalidate recorded evaluations. `evaluate_goal` followed by `update_goal complete` is not itself a mutation. Fresh-context evaluator independence is caller-enforced, not automatic or cryptographic.
-- While a goal is active, block detached/background `workflow` calls from pi-workflows unless `background: false` is explicit; blocking results and bounded failure markers must remain accounted; pi-goal does not orchestrate workflows.
-- Completion is gated by an `achieved` evaluation whose revision matches the goal revision and whose evidence is non-empty. The caller supplies a genuinely fresh, read-only evaluator (the pending `subagent` handoff is supported); the extension does not invoke or cryptographically attest a second model.
+- Domain transitions are pure and reducers reject stale run leases, revisions, and event sequences.
+- The event store is the only durable owner; replay is branch-scoped, bounded, idempotent by event ID, and snapshot-aware.
+- The controller serializes all goal mutations and external effects. Every provider dispatch has one run lease; stale lifecycle events cannot charge, continue, or abort replacement work.
+- Parent turns, nested usage, and execution time are accounted independently and idempotently. Limits are local stop conditions, not provider-plan quotas.
+- User input supersedes pending continuations. Unacknowledged continuation delivery blocks after a bounded timeout rather than leaving an active goal stranded.
+- Restart and tree reconstruction do not auto-run. Forks clear inherited goals. Compaction pauses an interrupted run, snapshots state, and resumes through one recovery continuation after success.
+- Progress checkpoints are bounded and include concrete evidence. Failed tools and prose-only cycles do not count as progress.
+- Evaluation claims are invalidated by workspace/tool activity, user steering, tree changes, compaction, replacement, and lifecycle context changes. Fresh evaluator independence is caller-enforced.
+- No compatibility shims, duplicate state authorities, Git mutation, or arbitrary shell hooks.
