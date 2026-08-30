@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "l0q6",
+  "title": "Keep normal Pi prompts working when no goal is active",
+  "description": "Regression fix: pi-goal must not abort ordinary provider requests when the session has no active goal. Add an adapter regression test and verify full checks.",
+  "status": "done",
+  "priority": 1,
+  "labels": [
+    "bug",
+    "regression"
+  ],
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T05:40:30.088831Z",
+      "msg": "Root cause: before_provider_request unconditionally called ctx.abort() when no active goal, which aborted every ordinary prompt. Fixed the guard to return when no goal or non-active goal; added regression coverage. Verification: bun test 28 passed / 60 expectations, bunx tsc --noEmit, git diff --check."
+    }
+  ],
+  "created_at": "2026-08-30T05:40:26.113258Z",
+  "updated_at": "2026-08-30T05:40:30.098931Z",
+  "completed_at": "2026-08-30T05:40:30.098931Z",
+  "external": {}
+}
