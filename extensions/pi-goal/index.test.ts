@@ -39,6 +39,14 @@ beforeEach(async () => {
 });
 
 describe("pi-goal supervisor", () => {
+  test("does not abort ordinary provider requests without an active goal", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.handlers.get("before_provider_request")({ type: "before_provider_request", payload: {} }, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+  });
+
   test("requires an explicit definition of done", async () => {
     const pi = createMockAPI();
     extension(pi as any);

@@ -464,7 +464,8 @@ export default function piGoal(pi: ExtensionAPI): void {
 
   pi.on("before_provider_request", (_event, ctx) => {
     const current = stateOrNull(ctx);
-    if (!runtimeRun || !current || current.status !== "active" || current.activeRun?.runId !== runtimeRun.runId) ctx.abort();
+    if (!current || current.status !== "active") return;
+    if (!runtimeRun || current.activeRun?.runId !== runtimeRun.runId) ctx.abort();
   });
 
   pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
