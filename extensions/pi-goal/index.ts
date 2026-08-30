@@ -171,7 +171,12 @@ export default function piGoal(pi: ExtensionAPI): void {
   }
 
   function syncTools(state: GoalState | null): void {
-    const current = pi.getActiveTools();
+    let current: string[];
+    try {
+      current = pi.getActiveTools();
+    } catch {
+      current = [];
+    }
     const names = new Set(current);
     names.add("create_goal");
     for (const name of GOAL_TOOLS) {

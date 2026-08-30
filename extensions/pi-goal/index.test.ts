@@ -50,6 +50,15 @@ describe("pi-goal supervisor", () => {
     expect(pi.getActiveTools()).toEqual([...BUILTIN_TOOLS, "create_goal"]);
   });
 
+  test("keeps the creation tool active when active-tool introspection is unavailable", async () => {
+    const pi = createMockAPI() as any;
+    pi.getActiveTools = mock(() => { throw new Error("active tools are not available yet"); });
+    extension(pi);
+    const ctx = createMockCtx(pi.entries);
+    await pi.handlers.get("before_provider_request")({ type: "before_provider_request", payload: {} }, ctx);
+    expect(pi.setActiveTools).toHaveBeenCalledWith(["create_goal"]);
+  });
+
   test("starts a run when a goal is created during an existing provider cycle", async () => {
     const pi = createMockAPI();
     extension(pi as any);
