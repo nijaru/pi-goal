@@ -89,6 +89,8 @@ interface GoalState {
     totalTokens: number;
     cost: number;
   };
+  /** Materialized seconds spent in goal-owned provider runs. */
+  timeUsedSeconds: number;
   revision: number;
   iterations: Iteration[];
   ideas: string[];
@@ -117,6 +119,8 @@ interface GoalPatch {
   /** Optional hard provider-turn ceiling; null means unlimited. */
   maxTurns: number | null;
   usage: GoalState["usage"];
+  /** Optional for compatibility with older schema-version-1 patches. */
+  timeUsedSeconds?: number;
   revision: number;
   updatedAt: string;
   blocker: string | null;
@@ -159,6 +163,8 @@ interface ActiveRun {
   turnsSeen: Set<number>;
   hadToolActivity: boolean;
   hadMeaningfulActivity: boolean;
+  /** Last wall-clock checkpoint for this goal-owned run. */
+  timeLastAccountedMs: number;
 }
 
 interface DeferredDispatchFailure {
@@ -267,6 +273,7 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
   if (!isRecord(value.usage)) return null;
   const usage = value.usage as { turns?: unknown; inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown; cost?: unknown };
   if (!isNonNegativeInteger(usage.turns) || !isNonNegativeInteger(usage.inputTokens) || !isNonNegativeInteger(usage.outputTokens) || !isNonNegativeInteger(usage.totalTokens) || !isNonNegativeNumber(usage.cost) || usage.cost > MAX_PERSISTED_NUMBER) return null;
+  if (value.timeUsedSeconds !== undefined && !isNonNegativeInteger(value.timeUsedSeconds)) return null;
   if (!isBoundedInteger(value.revision, MAX_REVISION) && value.revision !== 0) return null;
   if (!Array.isArray(value.iterations) || value.iterations.length > MAX_ITERATIONS) return null;
   if (!Array.isArray(value.ideas) || value.ideas.length > MAX_IDEAS || value.ideas.some(i => typeof i !== "string")) return null;
@@ -290,6 +297,7 @@ function validateGoal(value: unknown, expectedSessionId: string): GoalState | nu
       totalTokens: usage.totalTokens,
       cost: usage.cost,
     },
+    timeUsedSeconds: value.timeUsedSeconds === undefined ? 0 : value.timeUsedSeconds,
     revision,
     iterations: iterations as Iteration[],
     ideas: value.ideas.map(i => truncate(i, MAX_TEXT)),
@@ -341,7 +349,7 @@ function isMonotonicState(previous: GoalState, next: GoalState): boolean {
   if (next.revision === previous.revision && (budgetTightened || turnsTightened)) return false;
   const previousUsage = previous.usage;
   const nextUsage = next.usage;
-  if (nextUsage.turns < previousUsage.turns || nextUsage.inputTokens < previousUsage.inputTokens || nextUsage.outputTokens < previousUsage.outputTokens || nextUsage.totalTokens < previousUsage.totalTokens || nextUsage.cost < previousUsage.cost) return false;
+  if (nextUsage.turns < previousUsage.turns || nextUsage.inputTokens < previousUsage.inputTokens || nextUsage.outputTokens < previousUsage.outputTokens || nextUsage.totalTokens < previousUsage.totalTokens || nextUsage.cost < previousUsage.cost || next.timeUsedSeconds < previous.timeUsedSeconds) return false;
   if (next.iterations.length < previous.iterations.length || next.ideas.length < previous.ideas.length) return false;
   return true;
 }
@@ -359,6 +367,7 @@ function scalarPatch(goal: GoalState): Omit<GoalPatch, "schemaVersion" | "kind" 
     budget: goal.budget,
     maxTurns: goal.maxTurns,
     usage: clone(goal.usage),
+    timeUsedSeconds: goal.timeUsedSeconds,
     revision: goal.revision,
     updatedAt: goal.updatedAt,
     blocker: goal.blocker ?? null,
@@ -375,6 +384,7 @@ function applyPatch(current: GoalState, data: unknown, expectedSessionId: string
   if (!["active", "paused", "blocked", "budget_limited", "complete", "cleared"].includes(String(data.status))) return null;
   if ((data.budget !== null && (!isPositiveNumber(data.budget) || data.budget > MAX_BUDGET)) || (data.maxTurns !== null && !isBoundedInteger(data.maxTurns, MAX_MAX_TURNS))) return null;
   if (!isRecord(data.usage) || !isNonNegativeInteger(data.usage.turns) || !isNonNegativeInteger(data.usage.inputTokens) || !isNonNegativeInteger(data.usage.outputTokens) || !isNonNegativeInteger(data.usage.totalTokens) || !isNonNegativeNumber(data.usage.cost) || data.usage.cost > MAX_PERSISTED_NUMBER) return null;
+  if (data.timeUsedSeconds !== undefined && !isNonNegativeInteger(data.timeUsedSeconds)) return null;
   if ((!isBoundedInteger(data.revision, MAX_REVISION) && data.revision !== 0) || typeof data.updatedAt !== "string" || data.updatedAt.length > MAX_TEXT) return null;
   if (data.blocker !== null && typeof data.blocker !== "string") return null;
   if (data.stopReason !== null && typeof data.stopReason !== "string") return null;
@@ -387,6 +397,7 @@ function applyPatch(current: GoalState, data: unknown, expectedSessionId: string
   next.budget = data.budget;
   next.maxTurns = data.maxTurns;
   next.usage = clone(data.usage) as GoalState["usage"];
+  if (data.timeUsedSeconds !== undefined) next.timeUsedSeconds = data.timeUsedSeconds;
   next.revision = data.revision as number;
   next.updatedAt = data.updatedAt;
   if (data.blocker === null) delete next.blocker; else next.blocker = truncate(data.blocker);
@@ -554,6 +565,7 @@ function goalDetails(goal: GoalState): Record<string, unknown> {
     budget: goal.budget,
     maxTurns: goal.maxTurns,
     usage: clone(goal.usage),
+    timeUsedSeconds: goal.timeUsedSeconds,
     revision: goal.revision,
     iterations: goal.iterations.slice(-3).map(clone),
     ideas: goal.ideas.slice(-10),
@@ -566,9 +578,9 @@ function goalDetails(goal: GoalState): Record<string, unknown> {
 }
 
 function elapsed(goal: GoalState): string {
-  const ms = Math.max(0, Date.now() - new Date(goal.createdAt).getTime());
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.floor((ms % 60_000) / 1_000);
+  const totalSeconds = Math.max(0, goal.timeUsedSeconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
@@ -905,6 +917,23 @@ export default function piGoal(pi: ExtensionAPI) {
     pi.setActiveTools([...next]);
   }
 
+  function accountRunTime(run: ActiveRun, goal: GoalState, at = Date.now()): boolean {
+    if (run.timeLastAccountedMs < 0) {
+      run.timeLastAccountedMs = at;
+      return false;
+    }
+    const elapsedMs = at - run.timeLastAccountedMs;
+    if (elapsedMs <= 0) {
+      if (elapsedMs < 0) run.timeLastAccountedMs = at;
+      return false;
+    }
+    const seconds = Math.floor(elapsedMs / 1_000);
+    if (seconds <= 0) return false;
+    goal.timeUsedSeconds = boundedAdd(goal.timeUsedSeconds, seconds);
+    run.timeLastAccountedMs += seconds * 1_000;
+    return true;
+  }
+
   function updateWidget(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     const goal = rt.goal;
@@ -1236,6 +1265,7 @@ export default function piGoal(pi: ExtensionAPI) {
       budget,
       maxTurns,
       usage: { turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 },
+      timeUsedSeconds: 0,
       revision: 0,
       iterations: [],
       ideas: [],
@@ -1329,6 +1359,14 @@ export default function piGoal(pi: ExtensionAPI) {
     if (rt.settlementOwner === settlementOwner) rt.settlementOwner = null;
   });
   pi.on("session_shutdown", (_event, ctx) => {
+    // Reload may fence a provider run before Pi emits turn_end/agent_end.
+    // Materialize the completed portion up to this boundary so shutdown does
+    // not silently lose execution time; the runtime-local anchor prevents a
+    // later lifecycle event from charging it twice.
+    const runAtShutdown = rt.activeRun;
+    if (runAtShutdown && !runAtShutdown.discardUsage && runAtShutdown.goal && runAtShutdown.goalId && accountRunTime(runAtShutdown, runAtShutdown.goal)) {
+      persistPatch(pi, runAtShutdown.goal);
+    }
     // Reload replaces the extension runtime while Pi may still be streaming.
     // Fence goal-owned work before clearing its ownership markers; otherwise
     // the replacement runtime receives only the tail of an in-flight run and
@@ -1380,6 +1418,7 @@ export default function piGoal(pi: ExtensionAPI) {
     run.goalGeneration = rt.goalGeneration;
     run.goal = goal;
     run.userOwned ||= userOwned;
+    if (run.timeLastAccountedMs < 0) run.timeLastAccountedMs = Date.now();
     if (markLimitIfNeeded(goal)) {
       persistPatch(pi, goal);
       updateWidget(ctx);
@@ -1588,6 +1627,7 @@ export default function piGoal(pi: ExtensionAPI) {
       turnsSeen: new Set(),
       hadToolActivity: false,
       hadMeaningfulActivity: false,
+      timeLastAccountedMs: ownerGoal ? Date.now() : -1,
     };
     if (!ownerGoal) return;
     if (markLimitIfNeeded(ownerGoal)) {
@@ -1668,9 +1708,16 @@ export default function piGoal(pi: ExtensionAPI) {
       // generation. Cleared/replaced goals are still accounted on tombstones.
       const currentRunOwnsGoal = currentGoal?.id === run.goalId && run.goalGeneration === rt.goalGeneration;
       const goal = currentRunOwnsGoal ? currentGoal! : run.goal;
+      // Account goal-owned wall-clock time separately from provider usage. It
+      // is checkpointed at lifecycle boundaries and excludes paused/reloaded
+      // periods because the run clock is runtime-local.
+      const timeChanged = accountRunTime(run, goal);
       // An aborted provider attempt after a reached limit is not another goal
       // turn and must not inflate usage beyond the hard ceiling.
-      if (goal.status === "budget_limited") return;
+      if (goal.status === "budget_limited") {
+        if (timeChanged) persistPatch(pi, goal);
+        return;
+      }
       // Account the parent provider turn and any nested model usage returned by
       // tools. A provider call can put cost over budget; the threshold is
       // checked after that call returns.
@@ -1724,6 +1771,9 @@ export default function piGoal(pi: ExtensionAPI) {
       const currentRunOwnsGoal = run.goalId !== null
         && goal?.id === run.goalId
         && run.goalGeneration === rt.goalGeneration;
+      if (!run.discardUsage && run.goal && run.goalId && accountRunTime(run, run.goal)) {
+        persistPatch(pi, run.goal);
+      }
       if (createdGoalOwnsRun && goal) {
         rt.settlementOwner = { goalId: goal.id, goalGeneration: rt.goalGeneration, activationEpoch: rt.activationEpoch, goal };
       } else if (currentRunOwnsGoal && goal) {

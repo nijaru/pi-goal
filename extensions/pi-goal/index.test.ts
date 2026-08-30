@@ -443,6 +443,7 @@ describe("pi-goal extension", () => {
     await pi.getTool("create_goal").execute("1", { objective: "reload-safe", budget: 5 }, undefined, undefined, ctx);
     await startRun(pi, ctx);
     ctx.isIdle.mockReturnValue(false);
+    vi.advanceTimersByTime(2_500);
 
     pi.handlers.get("session_shutdown")({ type: "session_shutdown", reason: "reload" }, ctx);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
@@ -461,6 +462,7 @@ describe("pi-goal extension", () => {
     const state = (await replacement.getTool("get_goal").execute("2", {}, undefined, undefined, replacementCtx)).details.goal;
     expect(state.status).toBe("active");
     expect(state.usage.turns).toBe(0);
+    expect(state.timeUsedSeconds).toBe(2);
   });
 
   test("reload does not abort an unrelated run", async () => {
@@ -1260,6 +1262,89 @@ describe("pi-goal extension", () => {
     expect(state.details.goal.usage.cost).toBe(1.5);
     expect(state.details.goal.usage.totalTokens).toBe(30);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("accounts active run time and excludes paused time", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.getTool("create_goal").execute("1", { objective: "track active time" }, undefined, undefined, ctx);
+    await startRun(pi, ctx);
+    vi.advanceTimersByTime(2_500);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+
+    let state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(2);
+    expect(pi.entries.at(-1)?.data.timeUsedSeconds).toBe(2);
+    await pi.getCommand("goal").handler("pause", ctx);
+    state = (await pi.getTool("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(2);
+
+    vi.advanceTimersByTime(5_000);
+    state = (await pi.getTool("get_goal").execute("4", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(2);
+
+    await pi.getCommand("goal").handler("resume", ctx);
+    await startRun(pi, ctx);
+    vi.advanceTimersByTime(1_500);
+    await endTurn(pi, ctx, assistant(0.1), 0);
+    await endRun(pi, ctx, [assistant(0.1)]);
+    state = (await pi.getTool("get_goal").execute("5", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(3);
+  });
+
+  test("reconstructs older schema-version-1 state without time accounting", async () => {
+    const source = createMockAPI();
+    extension(source as any);
+    const sourceCtx = createMockCtx(source.entries);
+    await source.getTool("create_goal").execute("1", { objective: "legacy time state" }, undefined, undefined, sourceCtx);
+    const legacyEntries = source.entries.map(entry => ({
+      ...entry,
+      data: { ...entry.data, timeUsedSeconds: undefined },
+    }));
+    for (const entry of legacyEntries) delete entry.data.timeUsedSeconds;
+
+    const pi = createMockAPI(legacyEntries);
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(0);
+  });
+
+  test("older patches preserve newer execution time", async () => {
+    const source = createMockAPI();
+    extension(source as any);
+    const sourceCtx = createMockCtx(source.entries);
+    await source.getTool("create_goal").execute("1", { objective: "patch compatibility" }, undefined, undefined, sourceCtx);
+    const snapshot = { ...source.entries[0].data, timeUsedSeconds: 7 };
+    const oldPatch = {
+      schemaVersion: 1,
+      kind: "patch",
+      id: snapshot.id,
+      sessionId: snapshot.sessionId,
+      status: snapshot.status,
+      budget: snapshot.budget,
+      maxTurns: snapshot.maxTurns,
+      usage: snapshot.usage,
+      revision: 1,
+      updatedAt: snapshot.updatedAt,
+      blocker: null,
+      stopReason: null,
+      evaluationRequested: null,
+      lastEvaluation: null,
+    };
+    const branch = [
+      { ...source.entries[0], data: snapshot },
+      { ...source.entries[0], data: oldPatch },
+    ];
+    const pi = createMockAPI(branch);
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    const state = (await pi.getTool("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.timeUsedSeconds).toBe(7);
   });
 
   test("accounts nested tool, compaction, and branch-summary usage without extra turns", async () => {
