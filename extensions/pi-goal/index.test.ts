@@ -63,6 +63,20 @@ describe("pi-goal supervisor", () => {
     expect(pi.getActiveTools()).toEqual([...BUILTIN_TOOLS, "create_goal", "get_goal", "goal_checkpoint", "evaluate_goal", "update_goal"]);
   });
 
+  test("continues a goal created in the first user cycle after startup", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "start a goal" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "tests pass" }, undefined, undefined, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("requires an explicit definition of done", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -87,7 +101,10 @@ describe("pi-goal supervisor", () => {
     await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
     vi.advanceTimersByTime(1_000);
     await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(0);
+    expect((await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal.activeRun).toBeDefined();
 
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
     const current = pi.entries.filter((entry: any) => entry.customType === "pi-goal/event").at(-1)?.data;
     expect(activeRunId).toBeString();
     expect(current.type).toBe("dispatch_requested");
@@ -117,9 +134,34 @@ describe("pi-goal supervisor", () => {
     await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
     await pi.handlers.get("agent_end")({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error" }] }, ctx);
-    const state = (await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect((await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const state = (await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
     expect(state.status).toBe("paused");
     expect(pi.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test("retries settle the same runtime only after the final response", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "done" }, undefined, undefined, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    const first = assistant(0.1);
+    const second = assistant(0.4);
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: first, toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error" }] }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: second, toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [second] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const state = (await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("active");
+    expect(state.usage.turns).toBe(2);
+    expect(state.usage.cost).toBeCloseTo(0.5);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   test("replacement aborts the old run instead of rebinding it", async () => {
@@ -167,6 +209,43 @@ describe("pi-goal supervisor", () => {
     await expect(pi.tools.get("evaluate_goal").execute("3", { requestId: request.details.requestId, verdict: "achieved", reason: "yes", evidence: "tests pass" }, undefined, undefined, ctx)).rejects.toThrow("stale");
   });
 
+  test("invalidates a pending evaluation after a failed mutation", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "tests pass" }, undefined, undefined, ctx);
+    const request = await pi.tools.get("evaluate_goal").execute("2", {}, undefined, undefined, ctx);
+    pi.handlers.get("tool_execution_end")({ type: "tool_execution_end", toolName: "write", isError: true }, ctx);
+    await Promise.resolve();
+    await expect(pi.tools.get("evaluate_goal").execute("3", { requestId: request.details.requestId, verdict: "achieved", reason: "yes", evidence: "tests pass" }, undefined, undefined, ctx)).rejects.toThrow("stale");
+  });
+
+  test("keeps the active lease through automatic compaction", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "done" }, undefined, undefined, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    const before = (await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.activeRun.runId;
+    await pi.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "overflow", willRetry: true }, ctx);
+    const after = (await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(after.status).toBe("active");
+    expect(after.activeRun.runId).toBe(before);
+    await pi.handlers.get("session_compact")({ type: "session_compact", compactionEntry: {} }, ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test("commands admit goal work after startup", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
+    await pi.commands.get("goal").handler("ship", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("blocks an unacknowledged continuation after its timeout", async () => {
     const pi = createMockAPI();
     extension(pi as any);
@@ -176,6 +255,36 @@ describe("pi-goal supervisor", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect((await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("blocked");
+  });
+
+  test("manual compaction recovers a run that settled before the hook", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "done" }, undefined, undefined, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [{ role: "assistant", stopReason: "aborted" }] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect((await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
+    await pi.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", willRetry: false }, ctx);
+    await pi.handlers.get("session_compact")({ type: "session_compact", compactionEntry: {} }, ctx);
+    expect((await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("manual compaction resumes an active goal after success", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    await pi.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", willRetry: false }, ctx);
+    expect((await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
+    await pi.handlers.get("session_compact")({ type: "session_compact", compactionEntry: {} }, ctx);
+    expect((await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal.status).toBe("active");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
   });
 
   test("compaction failure clears a pending continuation", async () => {

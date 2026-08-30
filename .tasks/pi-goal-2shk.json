@@ -1,0 +1,28 @@
+{
+  "project": "pi-goal",
+  "ref": "2shk",
+  "title": "Harden pi-goal lifecycle and activity ownership",
+  "description": "Fix remaining pi-goal design defects: settle runtime at agent_settled rather than agent_end, preserve lifecycle continuity after startup, invalidate evaluations after failed non-read-only tools, and harden active-tool synchronization. Add regression coverage and update context.",
+  "status": "done",
+  "priority": 2,
+  "labels": null,
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T09:45:29.88662Z",
+      "msg": "Reproduced lifecycle defects from Pi agent-session ordering. Moved runtime finalization and continuation dispatch to agent_settled, retained stop reason across retries, preserved automatic-compaction leases, and restored fenced manual-compaction recovery after the abort-before-hook boundary. Cleared startup gating on admitted input and explicit /goal actions. Failed non-control tools now invalidate pending evaluations; retry turn accounting uses per-message markers plus a monotonic run sequence."
+    },
+    {
+      "ts": "2026-08-30T09:48:57.360212Z",
+      "msg": "Verification complete: bun test passed 38 tests and 86 expectations; bunx tsc --noEmit passed; git diff --check passed. Live Pi/provider smoke testing remains unavailable."
+    }
+  ],
+  "created_at": "2026-08-30T09:17:42.168661Z",
+  "updated_at": "2026-08-30T09:48:57.371959Z",
+  "completed_at": "2026-08-30T09:48:57.371959Z",
+  "external": {}
+}
