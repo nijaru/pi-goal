@@ -32,6 +32,7 @@ const MAX_TURNS = 10_000;
 const MAX_EXECUTION_SECONDS = 31_536_000;
 const GOAL_TOOLS = ["get_goal", "goal_checkpoint", "evaluate_goal", "update_goal"] as const;
 const CONTROL_TOOLS = new Set(["create_goal", ...GOAL_TOOLS]);
+const READ_ONLY_INSPECTION_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 type Ctx = ExtensionContext & { signal?: AbortSignal };
 
@@ -140,6 +141,7 @@ export default function piGoal(pi: ExtensionAPI): void {
   let controllerSessionId: string | null = null;
   let runtimeRun: RuntimeRun | null = null;
   let userPromptPending = false;
+  let agentCycleActive = false;
   let startupPending = false;
   let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
   let executionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -156,9 +158,16 @@ export default function piGoal(pi: ExtensionAPI): void {
   }
 
   function syncTools(state: GoalState | null): void {
-    const names = new Set<string>(["create_goal"]);
-    if (state?.status === "active") for (const name of GOAL_TOOLS) names.add(name);
-    pi.setActiveTools([...names]);
+    const current = pi.getActiveTools();
+    const names = new Set(current);
+    names.add("create_goal");
+    for (const name of GOAL_TOOLS) {
+      if (state?.status === "active") names.add(name);
+      else names.delete(name);
+    }
+    const next = [...names];
+    if (next.length === current.length && next.every((name, index) => name === current[index])) return;
+    pi.setActiveTools(next);
   }
 
   function updateWidget(state: GoalState | null): void {
@@ -307,6 +316,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     controller = null;
     controllerSessionId = null;
     runtimeRun = null;
+    agentCycleActive = false;
     clearDispatchTimer();
     clearExecutionTimer();
     startupPending = true;
@@ -326,6 +336,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     controller = null;
     controllerSessionId = null;
     runtimeRun = null;
+    agentCycleActive = false;
     clearDispatchTimer();
     clearExecutionTimer();
     userPromptPending = false;
@@ -355,6 +366,7 @@ export default function piGoal(pi: ExtensionAPI): void {
       }
     }
     runtimeRun = null;
+    agentCycleActive = false;
     controller = null;
     controllerSessionId = null;
   });
@@ -425,6 +437,7 @@ export default function piGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_start", async (_event: AgentStartEvent, ctx) => {
+    agentCycleActive = true;
     const current = stateOrNull(ctx);
     if (!current || current.status !== "active" || runtimeRun) return;
     if (current.pendingDispatch) return;
@@ -483,11 +496,17 @@ export default function piGoal(pi: ExtensionAPI): void {
 
   pi.on("agent_end", async (event: AgentEndEvent, ctx) => {
     await finishRuntime(ctx, event);
+    agentCycleActive = false;
   });
 
   pi.on("tool_execution_end", (event: ToolExecutionEndEvent, ctx) => {
     if (CONTROL_TOOLS.has(event.toolName) || event.isError) return;
     const current = stateOrNull(ctx);
+    if (
+      current?.evaluation &&
+      current.evaluation.verdict === undefined &&
+      READ_ONLY_INSPECTION_TOOLS.has(event.toolName)
+    ) return;
     if (current?.status === "active") void ensure(ctx).invalidateActivity(`tool activity: ${event.toolName}`);
   });
 
@@ -523,11 +542,16 @@ export default function piGoal(pi: ExtensionAPI): void {
         ctx.abort();
       }
       const goal = await currentController.create({ objective: validateText(params.objective, "objective", MAX_OBJECTIVE), doneWhen: validateText(params.doneWhen, "doneWhen", MAX_OBJECTIVE), limits });
-      if (runtimeRun && !currentController.state?.activeRun) {
+      let result = goal;
+      if (!replacing && agentCycleActive && !runtimeRun && !goal.activeRun) {
+        result = await currentController.startRun("user");
+        if (result.activeRun) beginRuntime(result.activeRun);
+      } else if (runtimeRun && !currentController.state?.activeRun) {
         const next = await currentController.startRun("user", runtimeRun.runId);
         if (next.activeRun) beginRuntime(next.activeRun);
+        result = next;
       }
-      return { content: [{ type: "text" as const, text: `Goal created\nObjective: ${goal.objective}\nDone when: ${goal.doneWhen}` }], details: { goal: details(goal) } };
+      return { content: [{ type: "text" as const, text: `Goal created\nObjective: ${result.objective}\nDone when: ${result.doneWhen}` }], details: { goal: details(result) } };
     },
     renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 60)), 0, 0); },
     renderResult: renderText,

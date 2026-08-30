@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, mock, test, vi } from "bun:test";
 
+const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
 const createMockAPI = (branch: any[] = []) => {
   const handlers = new Map<string, any>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
-  const activeTools = new Set<string>();
+  const activeTools = new Set<string>(BUILTIN_TOOLS);
   return {
     on: mock((name: string, handler: any) => handlers.set(name, handler)),
     registerTool: mock((tool: any) => tools.set(tool.name, tool)),
@@ -45,6 +47,20 @@ describe("pi-goal supervisor", () => {
     const ctx = createMockCtx(pi.entries);
     await pi.handlers.get("before_provider_request")({ type: "before_provider_request", payload: {} }, ctx);
     expect(ctx.abort).toHaveBeenCalledTimes(0);
+    expect(pi.getActiveTools()).toEqual([...BUILTIN_TOOLS, "create_goal"]);
+  });
+
+  test("starts a run when a goal is created during an existing provider cycle", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "start a goal" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    const created = await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "tests pass" }, undefined, undefined, ctx);
+    await pi.handlers.get("before_provider_request")({ type: "before_provider_request", payload: {} }, ctx);
+    expect(created.details.goal.activeRun).toBeDefined();
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+    expect(pi.getActiveTools()).toEqual([...BUILTIN_TOOLS, "create_goal", "get_goal", "goal_checkpoint", "evaluate_goal", "update_goal"]);
   });
 
   test("requires an explicit definition of done", async () => {
@@ -128,6 +144,27 @@ describe("pi-goal supervisor", () => {
     await expect(pi.tools.get("evaluate_goal").execute("3", { requestId: request.details.requestId, verdict: "achieved", reason: "yes", evidence: "tests pass" }, undefined, undefined, ctx)).resolves.toBeDefined();
     const complete = await pi.tools.get("update_goal").execute("4", { status: "complete" }, undefined, undefined, ctx);
     expect(complete.details.goal.status).toBe("complete");
+  });
+
+  test("preserves a pending evaluation through successful read-only inspection", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "tests pass" }, undefined, undefined, ctx);
+    const request = await pi.tools.get("evaluate_goal").execute("2", {}, undefined, undefined, ctx);
+    pi.handlers.get("tool_execution_end")({ type: "tool_execution_end", toolName: "read", isError: false }, ctx);
+    await expect(pi.tools.get("evaluate_goal").execute("3", { requestId: request.details.requestId, verdict: "achieved", reason: "yes", evidence: "tests pass" }, undefined, undefined, ctx)).resolves.toBeDefined();
+  });
+
+  test("invalidates a pending evaluation after successful mutation", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "tests pass" }, undefined, undefined, ctx);
+    const request = await pi.tools.get("evaluate_goal").execute("2", {}, undefined, undefined, ctx);
+    pi.handlers.get("tool_execution_end")({ type: "tool_execution_end", toolName: "write", isError: false }, ctx);
+    await Promise.resolve();
+    await expect(pi.tools.get("evaluate_goal").execute("3", { requestId: request.details.requestId, verdict: "achieved", reason: "yes", evidence: "tests pass" }, undefined, undefined, ctx)).rejects.toThrow("stale");
   });
 
   test("blocks an unacknowledged continuation after its timeout", async () => {

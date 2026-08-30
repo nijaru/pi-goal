@@ -1,0 +1,28 @@
+{
+  "project": "pi-goal",
+  "ref": "vxij",
+  "title": "Preserve read-only evaluations during inspection",
+  "description": "Allow successful read-only inspection tools during a pending goal evaluation while keeping mutating tool activity stale; add adapter regression coverage and verify the project and context updates.",
+  "status": "done",
+  "priority": 2,
+  "labels": null,
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-08-30T07:02:20.896465Z",
+      "msg": "Confirmed bug in extensions/pi-goal/index.ts: every successful non-control tool currently invalidates a pending evaluation, including read-only inspection. Implementing the requested read-only exception and regression tests."
+    },
+    {
+      "ts": "2026-08-30T07:07:13.762485Z",
+      "msg": "Implemented read-only evaluation preservation, host-tool-preserving synchronization, and mid-cycle goal run startup. Added regressions for read-only inspection, mutating-tool staleness, tool availability, and provider-cycle creation. Verification passed: bunx tsc --noEmit; bun test (31 passed, 66 expectations); git diff --check."
+    }
+  ],
+  "created_at": "2026-08-30T07:02:18.74378Z",
+  "updated_at": "2026-08-30T07:07:13.778396Z",
+  "completed_at": "2026-08-30T07:07:13.778396Z",
+  "external": {}
+}
