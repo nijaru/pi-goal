@@ -1,8 +1,8 @@
 {
   "name": "pi-goal",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Session-scoped autonomous goals for pi with optional evidence-gated limits and completion.",
+  "description": "Session-scoped autonomous goals for pi with evidence-gated completion and optional execution limits.",
   "keywords": [
     "pi-package",
     "pi",
