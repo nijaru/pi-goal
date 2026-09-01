@@ -16,9 +16,9 @@ time and persists typed events in the current Pi session branch.
 
 - `/goal` — show status
 - `/goal <objective>` — create and start with a default definition of done
-- `/goal pause` — pause
+- `/goal pause` — pause; the running response finishes first
 - `/goal resume` — resume a paused or blocked goal; create a replacement after a limit stop
-- `/goal clear` — clear
+- `/goal clear` — clear (aliases: `stop`, `cancel`); the goal disappears from status, tools, and the widget
 
 ## Tools
 

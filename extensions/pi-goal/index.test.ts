@@ -173,7 +173,7 @@ describe("pi-goal supervisor", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  test("replacement aborts the old run instead of rebinding it", async () => {
+  test("replacement releases the old run without aborting the host turn", async () => {
     const pi = createMockAPI();
     extension(pi as any);
     const ctx = createMockCtx(pi.entries);
@@ -182,8 +182,87 @@ describe("pi-goal supervisor", () => {
     await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
     await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
     await pi.tools.get("create_goal").execute("2", { objective: "second", doneWhen: "done" }, undefined, undefined, ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+    const replaced = (await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(replaced.objective).toBe("second");
+    // The running cycle is bound to the replacement with a fresh lease.
+    expect(replaced.activeRun).toBeDefined();
+    expect(replaced.activeRun.owner).toBe("user");
+    // The running cycle is bound to the replacement with a fresh lease; its
+    // tail usage is attributed to the replacement, not the released goal.
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const settled = (await pi.tools.get("get_goal").execute("4", {}, undefined, undefined, ctx)).details.goal;
+    expect(settled.objective).toBe("second");
+    expect(settled.usage.turns).toBe(1);
+    expect(settled.activeRun).toBeUndefined();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("a blocked supervisor stop ends the response without aborting it", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "done" }, undefined, undefined, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const result = await pi.tools.get("goal_checkpoint").execute(String(attempt + 1), { action: "try", observation: "same failure", progress: "none", evidence: "none" }, undefined, undefined, ctx);
+      expect(result.content[0].text).toContain("Checkpoint recorded");
+    }
+    const blocked = (await pi.tools.get("get_goal").execute("5", {}, undefined, undefined, ctx)).details.goal;
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.activeRun).toBeUndefined();
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+    // The detached response settles without queueing further goal work.
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    expect((await pi.tools.get("get_goal").execute("6", {}, undefined, undefined, ctx)).details.goal.status).toBe("blocked");
+    expect(pi.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test("a limited goal stops at the turn boundary without cancelling the response", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.tools.get("create_goal").execute("1", { objective: "ship", doneWhen: "done", maxTurns: 1 }, undefined, undefined, ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    const state = (await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("limited");
+    expect(state.stopReason).toBe("turn limit reached");
+    // Hard ceilings cut the chain at the boundary: the completed turn stays
+    // visible and only the next provider request is cancelled.
     expect(ctx.abort).toHaveBeenCalledTimes(1);
-    expect((await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal.objective).toBe("second");
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [{ role: "assistant", stopReason: "aborted" }] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const settled = (await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(settled.status).toBe("limited");
+    expect(settled.activeRun).toBeUndefined();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test("a stale turn cannot charge a paused goal", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.commands.get("goal").handler("pause", ctx);
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const events = pi.entries.filter((entry: any) => entry.customType === "pi-goal/event");
+    expect(events.some((entry: any) => entry.data.type === "turn_accounted")).toBe(false);
+    await pi.commands.get("goal").handler("resume", ctx);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(2);
   });
 
   test("rejects a stale continuation and accepts fresh evaluation evidence", async () => {
@@ -253,6 +332,77 @@ describe("pi-goal supervisor", () => {
     await pi.handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
     await pi.commands.get("goal").handler("ship", ctx);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("pausing mid-cycle keeps the host turn running", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.commands.get("goal").handler("pause", ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+    expect((await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx)).details.goal.status).toBe("paused");
+    // The detached turn settles without being charged, queued, or resumed.
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const state = (await pi.tools.get("get_goal").execute("3", {}, undefined, undefined, ctx)).details.goal;
+    expect(state.status).toBe("paused");
+    expect(state.usage.turns).toBe(0);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("clearing mid-cycle keeps the host turn running and hides the goal", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "go" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.commands.get("goal").handler("clear", ctx);
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+    // Cleared is hidden from every surface immediately.
+    const cleared = await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(cleared.content[0].text).toBe("No active goal.");
+    // The detached turn settles without charging the cleared goal.
+    await pi.handlers.get("turn_end")({ type: "turn_end", turnIndex: 0, message: assistant(), toolResults: [] }, ctx);
+    await pi.handlers.get("agent_end")({ type: "agent_end", messages: [assistant()] }, ctx);
+    await pi.handlers.get("agent_settled")({ type: "agent_settled" }, ctx);
+    const events = pi.entries.filter((entry: any) => entry.customType === "pi-goal/event");
+    expect(events.filter((entry: any) => entry.data.type === "turn_accounted")).toHaveLength(0);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    // Tools revert to creation-only; the widget is removed.
+    expect(pi.setActiveTools).toHaveBeenLastCalledWith(expect.arrayContaining(["create_goal"]));
+    expect(pi.setActiveTools).toHaveBeenLastCalledWith(expect.not.arrayContaining(["goal_checkpoint"]));
+    await pi.commands.get("goal").handler("", ctx);
+  });
+
+  test("clearing twice reports no active goal without an error", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    await pi.commands.get("goal").handler("clear", ctx);
+    await pi.commands.get("goal").handler("clear", ctx);
+    const status = await pi.tools.get("get_goal").execute("2", {}, undefined, undefined, ctx);
+    expect(status.content[0].text).toBe("No active goal.");
+    const events = pi.entries.filter((entry: any) => entry.customType === "pi-goal/event");
+    expect(events.filter((entry: any) => entry.data.type === "cleared")).toHaveLength(1);
+  });
+
+  test("a cleared goal can be replaced after settling", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    await pi.commands.get("goal").handler("clear", ctx);
+    const created = await pi.tools.get("create_goal").execute("2", { objective: "next", doneWhen: "done" }, undefined, undefined, ctx);
+    expect(created.details.goal.objective).toBe("next");
+    expect(created.details.goal.status).toBe("active");
   });
 
   test("blocks an unacknowledged continuation after its timeout", async () => {

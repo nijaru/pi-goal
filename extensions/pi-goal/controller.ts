@@ -125,9 +125,9 @@ export class GoalController {
   checkpoint(runId: string, input: { action: string; observation: string; progress: ProgressKind; evidence: string }): Promise<GoalState> {
     return this.enqueue(() => {
       const state = this.requireState();
-      const next = this.commit(state.id, "checkpointed", { checkpoint: { runId, ...input } });
-      if (next.status === "blocked") this.host.abort();
-      return next;
+      // A blocked stop halts future cycles, not the in-flight response; the
+      // tool result tells the model to stop goal work.
+      return this.commit(state.id, "checkpointed", { checkpoint: { runId, ...input } });
     });
   }
 

@@ -1,0 +1,24 @@
+{
+  "project": "pi-goal",
+  "ref": "ogum",
+  "title": "Make pause and clear non-destructive; hide cleared goals",
+  "description": "User lifecycle commands must not cancel running turns, and cleared goals must disappear from status, tools, and widget. Keep replacement aborts.",
+  "status": "done",
+  "priority": 3,
+  "labels": null,
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-09-01T20:49:56.019289Z",
+      "msg": "Verified in Pi 0.84.4 host code: extension commands run immediately mid-stream (source of the destructive abort), abort() does not clear message queues, continuations dequeue before provider requests. Implemented releaseRuntime (lease+dispatch release, no abort), stale-continuation abort at message_start, cleared hidden from /goal status, get_goal, and widget, replacement rebinding with fresh lease, supervisor-blocked releases lease and terminates cleanly. 46 tests/tsc/diff-check pass."
+    }
+  ],
+  "created_at": "2026-09-01T18:52:43.271033Z",
+  "updated_at": "2026-09-01T20:49:56.031627Z",
+  "completed_at": "2026-09-01T20:49:56.031627Z",
+  "external": {}
+}

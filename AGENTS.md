@@ -23,6 +23,9 @@ completion, pause, block, limit, or clear.
 - No agent definitions: that belongs to pi-subagents
 - No destructive Git automation, arbitrary model-supplied shell hooks, or detached/background workflow work
 - Model-facing `update_goal` accepts only `complete` and `blocked`; user commands own pause, resume, clear, and replacement. A limit stop requires a replacement with revised limits
+- User lifecycle commands (pause, clear, replacement) never abort the running turn: they release the run lease and pending continuation, the in-flight response finishes as ordinary unaccounted work, and a still-active goal continues on the next cycle. Hard limits remain the only mid-run abort, cutting the chain at the turn boundary after the completed turn
+- Stale goal-owned continuations are aborted at `message_start` before reaching the provider; user work is never aborted
+- `cleared` is terminal and hidden from every surface (command status, tools, widget); a new goal can be created in the same session branch
 - Compatibility with the former schema, patch protocol, and project-global `.pi/goal` state is intentionally not supported
 
 ## Stack and tests

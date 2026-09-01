@@ -38,10 +38,10 @@ create_goal({
 | Command | Description |
 |---------|-------------|
 | `/goal` | Show status, limits, execution time, progress, and blocker |
-| `/goal <objective>` | Start an unlimited goal |
-| `/goal pause` | Pause the active goal |
+| `/goal <objective>` | Start an unlimited goal (replaces an active goal without cancelling the running turn) |
+| `/goal pause` | Pause the active goal; the running response finishes, the goal stops after it |
 | `/goal resume` | Resume a paused or blocked goal |
-| `/goal clear` | Clear the goal |
+| `/goal clear` | Clear the goal; it disappears from status, tools, and the widget. `stop` and `cancel` are aliases |
 
 ## Tools
 
@@ -77,6 +77,10 @@ cycles stop the supervisor with a concrete diagnostic.
 - User commands own pause, resume, clear, and replacement. A limit stop requires
   creating a replacement with revised limits. The model can only complete or
   block through `update_goal`.
+- Pause, clear, and replacement never cancel the running turn: the in-flight
+  response finishes as ordinary unaccounted work and a still-active goal
+  continues on the next cycle. Hard limits remain the only mid-run abort, at
+  the turn boundary.
 - Pi-goal does not commit, reset, clean, or execute arbitrary shell hooks.
 
 ## Persistence and architecture
