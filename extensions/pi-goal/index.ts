@@ -154,6 +154,7 @@ export default function piGoal(pi: ExtensionAPI): void {
   let controllerSessionId: string | null = null;
   let runtimeRun: RuntimeRun | null = null;
   let userPromptPending = false;
+  const userSupersededDispatches = new Set<string>();
   let agentCycleActive = false;
   let startupPending = false;
   let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -345,6 +346,9 @@ export default function piGoal(pi: ExtensionAPI): void {
     clearExecutionTimer();
     const pending = currentController.state?.pendingDispatch;
     if (pending) {
+      // The caller is user-owned lifecycle work. Pi may still deliver the
+      // follow-up after this state transition, so remember not to abort it.
+      userSupersededDispatches.add(pending.dispatchId);
       clearDispatchTimer();
       await currentController.supersedeContinuation(pending.dispatchId, reason).catch(() => undefined);
     }
@@ -364,6 +368,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     clearExecutionTimer();
     compactionRecovery = null;
     userPromptPending = false;
+    userSupersededDispatches.clear();
     startupPending = true;
     let current = stateOrNull(ctx);
     if (current?.activeRun) {
@@ -386,6 +391,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     clearExecutionTimer();
     compactionRecovery = null;
     userPromptPending = false;
+    userSupersededDispatches.clear();
     startupPending = false;
     let current = stateOrNull(ctx);
     if (current?.activeRun) {
@@ -414,6 +420,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     }
     runtimeRun = null;
     agentCycleActive = false;
+    userSupersededDispatches.clear();
     controller = null;
     controllerSessionId = null;
   });
@@ -481,6 +488,7 @@ export default function piGoal(pi: ExtensionAPI): void {
       startupPending = false;
       const current = stateOrNull(ctx);
       if (current?.pendingDispatch) {
+        userSupersededDispatches.add(current.pendingDispatch.dispatchId);
         clearDispatchTimer();
         await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "user input superseded the continuation").catch(() => undefined);
       }
@@ -521,10 +529,13 @@ export default function piGoal(pi: ExtensionAPI): void {
     const message = event.message;
     const dispatchId = message?.customType === GOAL_CONTINUATION && message.details?.dispatchId;
     if (typeof dispatchId === "string") {
-      if (userPromptPending) {
+      const userSuperseded = userSupersededDispatches.delete(dispatchId);
+      if (userPromptPending || userSuperseded) {
         clearDispatchTimer();
         await ensure(ctx).supersedeContinuation(dispatchId, "user input superseded the continuation").catch(() => undefined);
-        ctx.abort();
+        // Pi cannot remove a follow-up once it has been queued. Aborting here
+        // would also abort the user's queued/current work, so let Pi drain it
+        // as an ordinary queued message instead.
         return;
       }
       clearDispatchTimer();
@@ -545,6 +556,7 @@ export default function piGoal(pi: ExtensionAPI): void {
     if (message?.role === "user" && !runtimeRun) {
       const current = stateOrNull(ctx);
       if (current?.pendingDispatch) {
+        userSupersededDispatches.add(current.pendingDispatch.dispatchId);
         clearDispatchTimer();
         await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "user message superseded the continuation").catch(() => undefined);
       }

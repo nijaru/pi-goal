@@ -1,0 +1,27 @@
+{
+  "project": "pi-goal",
+  "ref": "xprf",
+  "title": "Fix pi-goal continuation abort lifecycle",
+  "description": "Reproduce and fix pi-goal continuation failures and Error: This operation was aborted with minimal lifecycle changes. Add focused regression coverage and run full checks.",
+  "status": "done",
+  "priority": 2,
+  "labels": [
+    "bug",
+    "regression"
+  ],
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-09-02T06:00:23.946564Z",
+      "msg": "Reproduced the abort race in the adapter: Pi can deliver a follow-up after user input or user-owned lifecycle superseded its dispatch; message_start then called ctx.abort(), which aborted the user's run/queued work. Track user-superseded dispatch IDs and let Pi drain those stale queued messages instead of aborting. Added regression coverage. Verification: bun test 47 passed / 126 expectations; bunx tsc --noEmit; git diff --check."
+    }
+  ],
+  "created_at": "2026-09-02T05:53:43.995667Z",
+  "updated_at": "2026-09-02T06:02:28.28506Z",
+  "completed_at": "2026-09-02T06:02:28.28506Z",
+  "external": {}
+}

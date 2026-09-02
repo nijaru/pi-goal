@@ -93,6 +93,25 @@ describe("pi-goal supervisor", () => {
     await expect(pi.tools.get("create_goal").execute("1", { objective: "ship" }, undefined, undefined, ctx)).rejects.toThrow("doneWhen");
   });
 
+  test("does not abort user work for a queued continuation superseded by input", async () => {
+    const pi = createMockAPI();
+    extension(pi as any);
+    const ctx = createMockCtx(pi.entries);
+    await pi.commands.get("goal").handler("ship", ctx);
+    const dispatchId = pi.entries.find((entry: any) => entry.data?.type === "dispatch_requested")?.data.dispatchId;
+    expect(dispatchId).toBeString();
+
+    pi.handlers.get("input")({ type: "input", source: "interactive", text: "new direction" }, ctx);
+    await pi.handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await pi.handlers.get("message_start")({ type: "message_start", message: { role: "user", content: [] } }, ctx);
+    await pi.handlers.get("message_start")({
+      type: "message_start",
+      message: { role: "custom", customType: "pi-goal/continuation", details: { dispatchId } },
+    }, ctx);
+
+    expect(ctx.abort).toHaveBeenCalledTimes(0);
+  });
+
   test("runs a checkpointed cycle and queues one continuation", async () => {
     const pi = createMockAPI();
     extension(pi as any);
