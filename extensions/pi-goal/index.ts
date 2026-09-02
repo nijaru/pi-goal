@@ -1,8 +1,9 @@
 /**
- * pi-goal: a session-scoped goal supervisor.
+ * pi-goal: a small, session-scoped goal supervisor.
  *
- * The domain reducer owns goal truth. The event store owns branch replay. This
- * adapter owns only Pi lifecycle translation and provider effects.
+ * Goal truth lives in typed events in the current Pi session branch. Runtime
+ * state only owns the currently running provider cycle and the one queued
+ * continuation Pi can deliver.
  */
 import type {
   AgentEndEvent,
@@ -12,48 +13,35 @@ import type {
   ExtensionContext,
   SessionCompactEvent,
   SessionTreeEvent,
-  ToolExecutionEndEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { randomUUID } from "node:crypto";
-import type { GoalState, ProgressKind, RunOwner, Usage } from "./domain.ts";
+import type { GoalState, RunOwner, Usage } from "./domain.ts";
 import { GoalController } from "./controller.ts";
-import { GoalStore, GoalStoreError, validateLimits } from "./store.ts";
+import { GoalStore } from "./store.ts";
 
 const GOAL_CONTEXT = "pi-goal/context";
 const GOAL_CONTINUATION = "pi-goal/continuation";
 const MAX_OBJECTIVE = 4_000;
-const MAX_TEXT = 2_000;
-const MAX_EVIDENCE = 4_000;
-const MAX_COST = 1_000_000;
-const MAX_TURNS = 10_000;
-const MAX_EXECUTION_SECONDS = 31_536_000;
-const GOAL_TOOLS = ["get_goal", "goal_checkpoint", "evaluate_goal", "update_goal"] as const;
+const GOAL_TOOLS = ["get_goal", "update_goal"] as const;
 const CONTROL_TOOLS = new Set(["create_goal", ...GOAL_TOOLS]);
-const READ_ONLY_INSPECTION_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 type Ctx = ExtensionContext & { signal?: AbortSignal };
 
 type RuntimeRun = {
   runId: string;
   owner: RunOwner;
-  startedAtMs: number;
   accountedAtMs: number;
-  turnIds: Set<string>;
   turnMarkers: Set<string>;
   seenTurnMessages: WeakSet<object>;
   nextTurnSequence: number;
-  checkpointSeen: boolean;
-  lastProgress: ProgressKind | null;
   lastStopReason?: string;
 };
 
 const clone = <T>(value: T): T => structuredClone(value);
-const truncate = (value: string, max = MAX_TEXT): string => Array.from(value).length > max ? `${Array.from(value).slice(0, max).join("")}…` : value;
-const now = (): string => new Date().toISOString();
+const truncate = (value: string, max = 2_000): string => Array.from(value).length > max ? `${Array.from(value).slice(0, max).join("")}…` : value;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
 function lastStopReason(messages: readonly unknown[]): string | undefined {
@@ -68,16 +56,10 @@ function fmtCost(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function validateText(value: unknown, label: string, max = MAX_TEXT): string {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is required.`);
-  if (value.length > max) throw new Error(`${label} must be ${max} characters or fewer.`);
+function validateObjective(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("objective is required.");
+  if (value.length > MAX_OBJECTIVE) throw new Error(`objective must be ${MAX_OBJECTIVE} characters or fewer.`);
   return value.trim();
-}
-
-function numeric(value: unknown, label: string, max: number): number | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > max) throw new Error(`${label} must be finite, positive, and no greater than ${max}.`);
-  return value;
 }
 
 function usageFrom(value: unknown): Usage {
@@ -115,32 +97,12 @@ function elapsed(state: GoalState): string {
   return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
-function recentProgress(state: GoalState): string {
-  return state.progress.checkpoints.slice(-3).map(checkpoint =>
-    `${checkpoint.sequence}. ${checkpoint.progress}: ${truncate(checkpoint.action, 100)} — ${truncate(checkpoint.observation, 180)}`,
-  ).join("\n");
-}
-
-function continuationPrompt(state: GoalState, forceAction: boolean): string {
+function continuationPrompt(state: GoalState): string {
   return [
-    forceAction ? "The previous cycle did not demonstrate progress." : "Continue the active goal.",
-    "Perform one concrete inspect/action step now; do not reply with a plan only.",
-    "When the step finishes, call goal_checkpoint with the action, observation, progress classification, and evidence.",
+    "Continue the active goal.",
+    "Work on the objective now using the available tools. Do not reply with a plan only.",
+    "When the objective is genuinely complete, call update_goal with status complete. If the work is genuinely blocked and cannot proceed without user input or an external change, call update_goal with status blocked.",
     `Objective: ${state.objective}`,
-    `Definition of done: ${state.doneWhen}`,
-    recentProgress(state) ? `Recent checkpoints:\n${recentProgress(state)}` : "No checkpoint has been recorded yet.",
-  ].join("\n\n");
-}
-
-function evaluationPrompt(state: GoalState): string {
-  return [
-    "Evaluate this goal in a fresh, read-only context.",
-    "Do not change files, run mutating commands, or trust the goal owner's conclusion.",
-    `Objective: ${state.objective}`,
-    `Definition of done: ${state.doneWhen}`,
-    `Current revision: ${state.revision}`,
-    recentProgress(state) || "No progress checkpoints recorded.",
-    "Return achieved only with concrete evidence that the definition of done is satisfied.",
   ].join("\n\n");
 }
 
@@ -158,17 +120,11 @@ export default function piGoal(pi: ExtensionAPI): void {
   let agentCycleActive = false;
   let startupPending = false;
   let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
-  let executionTimer: ReturnType<typeof setTimeout> | undefined;
   let compactionRecovery: { goalId: string } | null = null;
 
   function clearDispatchTimer(): void {
     if (dispatchTimer !== undefined) clearTimeout(dispatchTimer);
     dispatchTimer = undefined;
-  }
-
-  function clearExecutionTimer(): void {
-    if (executionTimer !== undefined) clearTimeout(executionTimer);
-    executionTimer = undefined;
   }
 
   function syncTools(state: GoalState | null): void {
@@ -213,8 +169,7 @@ export default function piGoal(pi: ExtensionAPI): void {
 
   function host(ctx: Ctx) {
     return {
-      abort: () => ctx.abort(),
-      sendContinuation: (message: { dispatchId: string; goalId: string; runId: string; forceAction: boolean; content: string }) => {
+      sendContinuation: (message: { dispatchId: string; goalId: string; runId: string; content: string }) => {
         clearDispatchTimer();
         pi.sendMessage({
           customType: GOAL_CONTINUATION,
@@ -259,83 +214,60 @@ export default function piGoal(pi: ExtensionAPI): void {
 
   function beginRuntime(run: GoalState["activeRun"]): void {
     if (!run) return;
-    clearExecutionTimer();
-    const at = Date.now();
-    runtimeRun = { runId: run.runId, owner: run.owner, startedAtMs: at, accountedAtMs: at, turnIds: new Set(), turnMarkers: new Set(), seenTurnMessages: new WeakSet(), nextTurnSequence: 0, checkpointSeen: false, lastProgress: null, lastStopReason: undefined };
-    const limit = controller?.state?.limits.maxExecutionSeconds;
-    if (limit !== null && limit !== undefined) {
-      const used = controller?.state?.usage.executionSeconds ?? 0;
-      const remaining = Math.max(0, limit - used);
-      executionTimer = setTimeout(() => {
-        if (runtimeRun?.runId !== run.runId || controller?.state?.activeRun?.runId !== run.runId) return;
-        const boundaryCtx = activeCtx;
-        if (!boundaryCtx) return;
-        void accountExecution(boundaryCtx).finally(() => {
-          if (runtimeRun?.runId === run.runId) boundaryCtx.abort();
-        });
-      }, remaining * 1_000);
-    }
+    runtimeRun = {
+      runId: run.runId,
+      owner: run.owner,
+      accountedAtMs: Date.now(),
+      turnMarkers: new Set(),
+      seenTurnMessages: new WeakSet(),
+      nextTurnSequence: 0,
+      lastStopReason: undefined,
+    };
   }
 
   function accountExecution(ctx: Ctx): Promise<void> {
     const run = runtimeRun;
-    const controllerNow = controller;
-    if (!run || !controllerNow || !controllerNow.state || controllerNow.state.activeRun?.runId !== run.runId) return Promise.resolve();
+    const currentController = controller;
+    if (!run || !currentController || currentController.state?.activeRun?.runId !== run.runId) return Promise.resolve();
     const at = Date.now();
     const seconds = Math.floor((at - run.accountedAtMs) / 1_000);
     if (seconds <= 0) return Promise.resolve();
     run.accountedAtMs += seconds * 1_000;
-    return controllerNow.accountExecution(run.runId, seconds).then(() => undefined).catch(error => {
+    return currentController.accountExecution(run.runId, seconds).then(() => undefined).catch(error => {
       ctx.ui.notify(error instanceof Error ? error.message : "Could not account execution time.", "error");
     });
   }
 
   async function finishRuntime(ctx: Ctx): Promise<void> {
-    const controllerNow = controller;
-    if (!controllerNow) return;
+    const currentController = controller;
+    if (!currentController) return;
     const run = runtimeRun;
     if (run) {
       await accountExecution(ctx);
-      const state = controllerNow.state;
+      const state = currentController.state;
       if (state?.activeRun?.runId === run.runId) {
-        const stopReason = run.lastStopReason;
-        if (state.status === "active" && (stopReason === "error" || stopReason === "aborted")) {
-          await controllerNow.endRun(run.runId);
-          await controllerNow.changeStatus("paused", stopReason === "aborted" ? "provider run interrupted" : "provider request failed").catch(() => undefined);
-          clearExecutionTimer();
-          if (runtimeRun === run) runtimeRun = null;
-          startupPending = false;
-          return;
+        if (state.status === "active" && (run.lastStopReason === "error" || run.lastStopReason === "aborted")) {
+          await currentController.endRun(run.runId);
+          await currentController.changeStatus("paused", run.lastStopReason === "aborted" ? "provider run interrupted" : "provider request failed").catch(() => undefined);
+        } else {
+          await currentController.endRun(run.runId);
         }
-        if (!run.checkpointSeen && state.status === "active") {
-          await controllerNow.checkpoint(run.runId, {
-            action: "provider cycle",
-            observation: "The provider cycle ended without a goal_checkpoint.",
-            progress: "none",
-            evidence: "No checkpoint was recorded.",
-          }).catch(() => undefined);
-        }
-        await controllerNow.endRun(run.runId);
       }
-      clearExecutionTimer();
       if (runtimeRun === run) runtimeRun = null;
     }
-    // A cycle that settled without a live lease (paused, cleared, or replaced
-    // mid-run) must not strand an active goal: continue once no user input,
-    // startup work, or queued dispatch owns the next cycle.
-    const settled = controllerNow.state;
+
+    const settled = currentController.state;
     if (settled?.status === "active" && !settled.activeRun && !settled.pendingDispatch && !userPromptPending && !startupPending) {
-      const forceAction = settled.progress.consecutiveNoProgress > 0;
-      await controllerNow.requestContinuation(forceAction, continuationPrompt(settled, forceAction)).catch(error => {
+      await currentController.requestContinuation(continuationPrompt(settled)).catch(error => {
         ctx.ui.notify(error instanceof Error ? error.message : "Could not queue the next goal cycle.", "error");
       });
     }
     startupPending = false;
   }
 
-  // Release the active run lease, timers, and any pending continuation without
-  // aborting the host turn. The in-flight cycle finishes naturally as ordinary
-  // (unaccounted) work; a still-active goal continues on the next cycle.
+  // User lifecycle actions release the goal lease but never cancel the host
+  // response. Pi may still deliver a queued follow-up, so its dispatch ID is
+  // remembered and drained without aborting user work.
   async function releaseRuntime(ctx: Ctx, currentController: GoalController, reason: string): Promise<void> {
     const run = runtimeRun;
     if (run) {
@@ -343,11 +275,8 @@ export default function piGoal(pi: ExtensionAPI): void {
       await currentController.endRun(run.runId).catch(() => undefined);
       if (runtimeRun === run) runtimeRun = null;
     }
-    clearExecutionTimer();
     const pending = currentController.state?.pendingDispatch;
     if (pending) {
-      // The caller is user-owned lifecycle work. Pi may still deliver the
-      // follow-up after this state transition, so remember not to abort it.
       userSupersededDispatches.add(pending.dispatchId);
       clearDispatchTimer();
       await currentController.supersedeContinuation(pending.dispatchId, reason).catch(() => undefined);
@@ -365,7 +294,6 @@ export default function piGoal(pi: ExtensionAPI): void {
     runtimeRun = null;
     agentCycleActive = false;
     clearDispatchTimer();
-    clearExecutionTimer();
     compactionRecovery = null;
     userPromptPending = false;
     userSupersededDispatches.clear();
@@ -376,19 +304,20 @@ export default function piGoal(pi: ExtensionAPI): void {
       current = stateOrNull(ctx);
       if (current?.status === "active") current = await ensure(ctx).changeStatus("paused", "previous provider run was interrupted by session restart");
     }
-    if (current?.status === "active") current = await ensure(ctx).invalidateActivity("session context restarted") ?? current;
-    if (current?.pendingDispatch) await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "reload superseded the pending continuation").catch(() => undefined);
+    if (current?.pendingDispatch) {
+      userSupersededDispatches.add(current.pendingDispatch.dispatchId);
+      await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "reload superseded the pending continuation").catch(() => undefined);
+    }
     if (event.reason === "fork" && current && current.status !== "cleared") await ensure(ctx).clear("forked session starts without the parent goal");
   });
 
-  pi.on("session_tree", async (event: SessionTreeEvent, ctx) => {
+  pi.on("session_tree", async (_event: SessionTreeEvent, ctx) => {
     ctx.abort();
     controller = null;
     controllerSessionId = null;
     runtimeRun = null;
     agentCycleActive = false;
     clearDispatchTimer();
-    clearExecutionTimer();
     compactionRecovery = null;
     userPromptPending = false;
     userSupersededDispatches.clear();
@@ -399,9 +328,10 @@ export default function piGoal(pi: ExtensionAPI): void {
       current = stateOrNull(ctx);
       if (current?.status === "active") current = await ensure(ctx).changeStatus("paused", "previous provider run was interrupted by tree navigation");
     }
-    if (current?.status === "active") current = await ensure(ctx).invalidateActivity("session tree changed") ?? current;
-    if (current?.pendingDispatch) await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "tree navigation superseded the pending continuation").catch(() => undefined);
-    if (event.summaryEntry?.usage) await accountExecution(ctx);
+    if (current?.pendingDispatch) {
+      userSupersededDispatches.add(current.pendingDispatch.dispatchId);
+      await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "tree navigation superseded the pending continuation").catch(() => undefined);
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -409,7 +339,6 @@ export default function piGoal(pi: ExtensionAPI): void {
     const shuttingController = controller;
     const shuttingRun = runtimeRun;
     clearDispatchTimer();
-    clearExecutionTimer();
     compactionRecovery = null;
     if (shuttingController && shuttingRun && shuttingController.state?.activeRun?.runId === shuttingRun.runId) {
       await accountExecution(ctx);
@@ -428,31 +357,21 @@ export default function piGoal(pi: ExtensionAPI): void {
   pi.on("session_before_compact", async (event, ctx) => {
     let current = stateOrNull(ctx);
     if (current?.pendingDispatch) {
+      userSupersededDispatches.add(current.pendingDispatch.dispatchId);
       clearDispatchTimer();
       current = await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "compaction superseded the pending continuation");
     }
-    // Automatic compaction runs inside Pi's current agent loop. Keep its lease so
-    // Pi can retry/continue that loop; only the context-dependent evaluation is stale.
     if (event.reason !== "manual") {
-      if (current?.status === "active") current = await ensure(ctx).invalidateActivity("context compaction changed the active context") ?? current;
-      if (current) ensure(ctx).snapshot(now());
+      if (current) ensure(ctx).snapshot();
       return;
     }
 
-    // Manual compaction aborts before this hook in Pi. Quarantine an unexpected
-    // orphan too, then recover exactly once after a successful compaction. A run
-    // that settled as an interruption is already paused before this hook arrives.
-    const recoverGoalId = current && (
-      current.status === "active" ||
-      (current.status === "paused" && current.stopReason === "provider run interrupted")
-    ) ? current.id : undefined;
+    const recoverGoalId = current && (current.status === "active" || (current.status === "paused" && current.stopReason === "provider run interrupted")) ? current.id : undefined;
     if (runtimeRun && current?.activeRun?.runId === runtimeRun.runId && current.status === "active") {
       await accountExecution(ctx);
       await ensure(ctx).endRun(runtimeRun.runId);
-      clearExecutionTimer();
       runtimeRun = null;
     } else if (runtimeRun) {
-      clearExecutionTimer();
       runtimeRun = null;
     }
     const afterRun = stateOrNull(ctx);
@@ -461,25 +380,27 @@ export default function piGoal(pi: ExtensionAPI): void {
       compactionRecovery = { goalId: recoverGoalId };
     }
     const after = stateOrNull(ctx);
-    if (after) ensure(ctx).snapshot(now());
+    if (after) ensure(ctx).snapshot();
   });
 
   pi.on("session_compact", async (event: SessionCompactEvent, ctx: Ctx) => {
-    if (event.compactionEntry.usage) await accountExecution(ctx);
+    await accountExecution(ctx);
     const recovery = compactionRecovery;
     compactionRecovery = null;
     if (!recovery) return;
     const current = stateOrNull(ctx);
     if (!current || current.id !== recovery.goalId || current.status !== "paused") return;
     const resumed = await ensure(ctx).changeStatus("active", "recovered after manual compaction");
-    await ensure(ctx).requestContinuation(false, continuationPrompt(resumed, false)).catch(error => ctx.ui.notify(error instanceof Error ? error.message : "Could not resume after compaction.", "error"));
+    await ensure(ctx).requestContinuation(continuationPrompt(resumed)).catch(error => ctx.ui.notify(error instanceof Error ? error.message : "Could not resume after compaction.", "error"));
   });
 
-  pi.on("session_compact_failed", async (_event: any, ctx: Ctx) => {
+  pi.on("session_compact_failed", async (_event: any, ctx) => {
     clearDispatchTimer();
-    compactionRecovery = null;
     const current = stateOrNull(ctx);
-    if (current?.pendingDispatch) await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "failed compaction superseded the pending continuation").catch(() => undefined);
+    if (current?.pendingDispatch) {
+      userSupersededDispatches.add(current.pendingDispatch.dispatchId);
+      await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "failed compaction superseded the pending continuation").catch(() => undefined);
+    }
   });
 
   pi.on("input", async (event: any, ctx) => {
@@ -492,7 +413,6 @@ export default function piGoal(pi: ExtensionAPI): void {
         clearDispatchTimer();
         await ensure(ctx).supersedeContinuation(current.pendingDispatch.dispatchId, "user input superseded the continuation").catch(() => undefined);
       }
-      if (current?.status === "active") await ensure(ctx).invalidateActivity("user steering changed the active context");
     }
   });
 
@@ -504,12 +424,9 @@ export default function piGoal(pi: ExtensionAPI): void {
         customType: GOAL_CONTEXT,
         display: false,
         content: [
-          "## Active goal protocol",
+          "## Active goal",
           `Objective: ${current.objective}`,
-          `Definition of done: ${current.doneWhen}`,
-          "Perform concrete work, then call goal_checkpoint with observed evidence.",
-          "Do not claim completion without a fresh evaluation.",
-          recentProgress(current) ? `Recent checkpoints:\n${recentProgress(current)}` : "No checkpoints yet.",
+          "Work toward the objective using the available tools. Call update_goal with status complete only when the objective is actually achieved. Call it with status blocked only when the same blocking condition has made further work impossible without user input or an external change.",
         ].join("\n\n"),
       },
     };
@@ -518,9 +435,7 @@ export default function piGoal(pi: ExtensionAPI): void {
   pi.on("agent_start", async (_event: AgentStartEvent, ctx) => {
     agentCycleActive = true;
     const current = stateOrNull(ctx);
-    if (!current || current.status !== "active" || runtimeRun) return;
-    if (current.pendingDispatch) return;
-    if (!userPromptPending) return;
+    if (!current || current.status !== "active" || runtimeRun || current.pendingDispatch || !userPromptPending) return;
     const next = await ensure(ctx).startRun("user").catch(() => null);
     if (next?.activeRun) beginRuntime(next.activeRun);
   });
@@ -533,9 +448,8 @@ export default function piGoal(pi: ExtensionAPI): void {
       if (userPromptPending || userSuperseded) {
         clearDispatchTimer();
         await ensure(ctx).supersedeContinuation(dispatchId, "user input superseded the continuation").catch(() => undefined);
-        // Pi cannot remove a follow-up once it has been queued. Aborting here
-        // would also abort the user's queued/current work, so let Pi drain it
-        // as an ordinary queued message instead.
+        // Pi has no queue-removal API. Let a user-superseded follow-up drain as
+        // an ordinary hidden message rather than aborting user work.
         return;
       }
       clearDispatchTimer();
@@ -543,16 +457,15 @@ export default function piGoal(pi: ExtensionAPI): void {
       if (acknowledged?.activeRun) {
         beginRuntime(acknowledged.activeRun);
       } else {
-        // Stale or failed continuation: never let it reach the provider as
-        // ordinary work; clear the dispatch so an active goal is not stranded.
         await ensure(ctx).failContinuation(dispatchId, "continuation acknowledgement failed").catch(() => undefined);
-        ctx.abort();
+        // Pi has no queue-removal API. Make a stale queued message inert and
+        // let it drain; aborting here would surface a provider error to the
+        // user and can cancel unrelated work.
+        if (isRecord(message)) message.content = "Ignore this stale goal continuation.";
       }
       return;
     }
-    if (message?.role === "user") {
-      userPromptPending = false;
-    }
+    if (message?.role === "user") userPromptPending = false;
     if (message?.role === "user" && !runtimeRun) {
       const current = stateOrNull(ctx);
       if (current?.pendingDispatch) {
@@ -566,11 +479,10 @@ export default function piGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
-    const current = stateOrNull(ctx);
-    if (!current || current.status !== "active") return;
-    // Abort only goal work that outlived its lease; an ordinary or detached
-    // cycle (no runtime lease) runs to completion untouched.
-    if (runtimeRun && current.activeRun?.runId !== runtimeRun.runId) ctx.abort();
+    // Keep tool visibility synchronized, but never cancel a provider request.
+    // User and session lifecycle ownership belongs to Pi; a detached provider
+    // cycle simply runs without charging or continuing the goal.
+    stateOrNull(ctx);
   });
 
   pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
@@ -588,7 +500,6 @@ export default function piGoal(pi: ExtensionAPI): void {
     if (turnMarker !== undefined && run.turnMarkers.has(turnMarker)) return;
     if (turnMarker !== undefined) run.turnMarkers.add(turnMarker);
     const turnId = `${run.runId}:${run.nextTurnSequence++}`;
-    run.turnIds.add(turnId);
     await accountExecution(ctx);
     let usage = usageFrom(event.message);
     for (const toolResult of event.toolResults ?? []) usage = addUsage(usage, usageFrom(toolResult));
@@ -604,59 +515,23 @@ export default function piGoal(pi: ExtensionAPI): void {
     await finishRuntime(ctx);
   });
 
-  pi.on("tool_execution_end", async (event: ToolExecutionEndEvent, ctx) => {
-    if (CONTROL_TOOLS.has(event.toolName)) return;
-    const current = stateOrNull(ctx);
-    if (
-      !event.isError &&
-      current?.evaluation &&
-      current.evaluation.verdict === undefined &&
-      READ_ONLY_INSPECTION_TOOLS.has(event.toolName)
-    ) return;
-    if (current?.status === "active") await ensure(ctx).invalidateActivity(`tool activity: ${event.toolName}`);
-  });
-
-  pi.on("user_bash", async (_event: any, ctx) => {
-    const current = stateOrNull(ctx);
-    if (current?.status === "active") await ensure(ctx).invalidateActivity("user bash activity");
-  });
-
-  const parameters = {
-    objective: Type.String({ description: "Concrete objective." }),
-    doneWhen: Type.String({ description: "Explicit, verifiable definition of done." }),
-    maxCost: Type.Optional(Type.Number({ description: "Maximum USD spend." })),
-    maxTurns: Type.Optional(Type.Number({ description: "Maximum provider turns." })),
-    maxExecutionSeconds: Type.Optional(Type.Number({ description: "Maximum active provider execution seconds." })),
-  };
-
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
-    description: "Create or replace a persistent goal with an explicit definition of done and optional hard limits.",
-    promptSnippet: "Create a persistent goal with a verifiable definition of done",
-    promptGuidelines: ["Use only when the user explicitly requests autonomous goal work.", "Always provide one objective and an explicit definition of done."],
-    parameters: Type.Object(parameters),
+    description: "Create a goal only when explicitly requested by the user. Fails while another goal in this session is unfinished.",
+    promptSnippet: "Create a persistent goal",
+    promptGuidelines: ["Use only when the user explicitly requests autonomous goal work."],
+    parameters: Type.Object({ objective: Type.String({ description: "The concrete objective to pursue." }) }),
     async execute(_id, params, _signal, _update, ctx) {
-      const limits = { maxCost: numeric(params.maxCost, "maxCost", MAX_COST), maxTurns: numeric(params.maxTurns, "maxTurns", MAX_TURNS), maxExecutionSeconds: numeric(params.maxExecutionSeconds, "maxExecutionSeconds", MAX_EXECUTION_SECONDS) };
-      if (limits.maxTurns !== null && !Number.isSafeInteger(limits.maxTurns)) throw new Error("maxTurns must be a safe integer.");
-      validateLimits(limits);
-      const objective = validateText(params.objective, "objective", MAX_OBJECTIVE);
-      const doneWhen = validateText(params.doneWhen, "doneWhen", MAX_OBJECTIVE);
+      const objective = validateObjective(params.objective);
       const currentController = ensure(ctx);
-      const replacing = currentController.state !== null && currentController.state.status !== "cleared";
-      if (replacing) {
-        await releaseRuntime(ctx, currentController, "replaced by a new goal");
-        compactionRecovery = null;
-      }
-      const goal = await currentController.create({ objective, doneWhen, limits });
+      const goal = await currentController.create({ objective });
       let result = goal;
       if (agentCycleActive && !runtimeRun && !goal.activeRun) {
-        // Bind the running cycle to the new goal with a fresh lease so the
-        // model can continue and checkpoint in the same turn.
         result = await currentController.startRun("user");
         if (result.activeRun) beginRuntime(result.activeRun);
       }
-      return { content: [{ type: "text" as const, text: `Goal created\nObjective: ${result.objective}\nDone when: ${result.doneWhen}` }], details: { goal: details(result) } };
+      return { content: [{ type: "text" as const, text: `Goal created\nObjective: ${result.objective}` }], details: { goal: details(result) } };
     },
     renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("create_goal ")) + theme.fg("accent", truncate(args.objective, 60)), 0, 0); },
     renderResult: renderText,
@@ -665,96 +540,31 @@ export default function piGoal(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "get_goal",
     label: "Get Goal",
-    description: "Read the structured goal state, usage, limits, progress checkpoints, and evaluation claim.",
-    promptSnippet: "Inspect goal state and progress",
+    description: "Read the current goal, status, usage, and blocker.",
+    promptSnippet: "Inspect the current goal",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _update, ctx) {
       const goal = stateOrNull(ctx);
       if (!goal || goal.status === "cleared") return { content: [{ type: "text" as const, text: "No active goal." }], details: {} };
-      return { content: [{ type: "text" as const, text: [`Objective: ${goal.objective}`, `Done when: ${goal.doneWhen}`, `Status: ${goal.status}`, `Usage: ${fmtCost(goal.usage.cost)} · ${goal.usage.turns} turns · ${elapsed(goal)}`, `Progress: ${goal.progress.checkpoints.length} checkpoints`, goal.stopReason ? `Stop reason: ${goal.stopReason}` : "", goal.blocker ? `Blocker: ${goal.blocker}` : ""].filter(Boolean).join("\n") }], details: { goal: details(goal) } };
+      return { content: [{ type: "text" as const, text: [`Objective: ${goal.objective}`, `Status: ${goal.status}`, `Usage: ${fmtCost(goal.usage.cost)} · ${goal.usage.turns} turns · ${elapsed(goal)}`, goal.stopReason ? `Stop reason: ${goal.stopReason}` : "", goal.blocker ? `Blocker: ${goal.blocker}` : ""].filter(Boolean).join("\n") }], details: { goal: details(goal) } };
     },
     renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("get_goal")), 0, 0); },
     renderResult: renderText,
   });
 
   pi.registerTool({
-    name: "goal_checkpoint",
-    label: "Goal Checkpoint",
-    description: "Record the concrete action, observation, progress classification, and evidence for the current provider cycle.",
-    promptSnippet: "Record observed goal progress",
-    parameters: Type.Object({
-      action: Type.String({ description: "Concrete action performed." }),
-      observation: Type.String({ description: "What the action showed." }),
-      progress: StringEnum(["made", "blocked", "none"] as const),
-      evidence: Type.String({ description: "Command output, test result, or other concrete evidence." }),
-    }),
-    async execute(_id, params, _signal, _update, ctx) {
-      const goal = stateOrNull(ctx);
-      if (!goal?.activeRun) throw new Error("No active goal run.");
-      const action = validateText(params.action, "action");
-      const observation = validateText(params.observation, "observation");
-      const evidence = validateText(params.evidence, "evidence", MAX_EVIDENCE);
-      const next = await ensure(ctx).checkpoint(goal.activeRun.runId, { action, observation, progress: params.progress, evidence });
-      if (runtimeRun) { runtimeRun.checkpointSeen = true; runtimeRun.lastProgress = params.progress; }
-      const blocked = next.status === "blocked";
-      if (blocked) {
-        // The supervisor stopped the loop; finish the in-flight response without
-        // aborting it. Release the lease so remaining work is ordinary and free.
-        clearExecutionTimer();
-        runtimeRun = null;
-      }
-      const text = blocked
-        ? `Checkpoint recorded: ${params.progress}\nGoal blocked: ${next.blocker ?? "repeated cycles made no progress"}. Stop goal work; the user must resume or replace the goal.`
-        : `Checkpoint recorded: ${params.progress}`;
-      return { content: [{ type: "text" as const, text }], details: { checkpoint: next.progress.checkpoints.at(-1), goal: details(next) }, ...(blocked ? { terminate: true } : {}) };
-    },
-    renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("goal_checkpoint ")) + theme.fg("accent", args.progress), 0, 0); },
-    renderResult: renderText,
-  });
-
-  pi.registerTool({
-    name: "evaluate_goal",
-    label: "Evaluate Goal",
-    description: "Request or record an independent, read-only evaluation of the current goal revision.",
-    promptSnippet: "Evaluate whether the goal is complete",
-    parameters: Type.Object({
-      requestId: Type.Optional(Type.String()),
-      verdict: Type.Optional(StringEnum(["achieved", "not_yet", "error"] as const)),
-      reason: Type.Optional(Type.String()),
-      evidence: Type.Optional(Type.String()),
-    }),
-    async execute(_id, params, _signal, _update, ctx) {
-      const currentController = ensure(ctx);
-      if (!params.verdict) {
-        const request = await currentController.requestEvaluation();
-        return { content: [{ type: "text" as const, text: `Evaluation request: ${request.requestId}\n\n${evaluationPrompt(request.promptState)}` }], details: { requestId: request.requestId, goal: details(request.promptState) } };
-      }
-      const requestId = validateText(params.requestId, "requestId", 128);
-      const reason = validateText(params.reason, "reason");
-      const evidence = params.evidence === undefined ? undefined : validateText(params.evidence, "evidence", MAX_EVIDENCE);
-      const goal = await currentController.recordEvaluation({ requestId, verdict: params.verdict, reason, ...(evidence ? { evidence } : {}) });
-      return { content: [{ type: "text" as const, text: `Evaluation recorded: ${params.verdict}` }], details: { evaluation: goal.evaluation, goal: details(goal) } };
-    },
-    renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("evaluate_goal")), 0, 0); },
-    renderResult: renderText,
-  });
-
-  pi.registerTool({
     name: "update_goal",
     label: "Update Goal",
-    description: "Complete or block a goal. Completion requires an achieved current evaluation; pause, resume, clear, and replacement are user commands.",
+    description: "Mark the active goal complete or genuinely blocked.",
     promptSnippet: "Complete or block the active goal",
-    promptGuidelines: ["Complete only after a fresh evaluator records achieved with concrete evidence.", "Block only when a concrete external dependency or user decision is required."],
-    parameters: Type.Object({ status: StringEnum(["complete", "blocked"] as const), blocker: Type.Optional(Type.String()) }),
+    promptGuidelines: ["Complete only when the objective is actually achieved.", "Block only when progress is impossible without user input or an external change."],
+    parameters: Type.Object({ status: StringEnum(["complete", "blocked"] as const) }),
     async execute(_id, params, _signal, _update, ctx) {
       const currentController = ensure(ctx);
-      if (params.status === "complete") {
-        const goal = await currentController.complete();
-        return { content: [{ type: "text" as const, text: `Goal complete\nObjective: ${goal.objective}` }], details: { goal: details(goal) }, terminate: true };
-      }
-      const blocker = validateText(params.blocker, "blocker");
-      const goal = await currentController.changeStatus("blocked", "requires user input or external dependency", blocker);
-      return { content: [{ type: "text" as const, text: `Goal blocked\nBlocker: ${blocker}` }], details: { goal: details(goal) }, terminate: true };
+      const goal = params.status === "complete"
+        ? await currentController.changeStatus("complete", "completed by model")
+        : await currentController.changeStatus("blocked", "blocked by model");
+      return { content: [{ type: "text" as const, text: `Goal ${params.status}\nObjective: ${goal.objective}` }], details: { goal: details(goal) }, terminate: true };
     },
     renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("update_goal ")) + theme.fg(args.status === "complete" ? "success" : "warning", args.status), 0, 0); },
     renderResult: renderText,
@@ -762,7 +572,7 @@ export default function piGoal(pi: ExtensionAPI): void {
 
   function statusText(state: GoalState | null): string {
     if (!state || state.status === "cleared") return "No active goal.";
-    return [`🎯 [${state.status}] ${state.objective}`, `Done when: ${state.doneWhen}`, `Usage: ${fmtCost(state.usage.cost)} · ${state.usage.turns} turns · execution ${elapsed(state)}`, `Progress: ${state.progress.checkpoints.length} checkpoints`, state.stopReason ? `Stop reason: ${state.stopReason}` : "", state.blocker ? `Blocker: ${state.blocker}` : ""].filter(Boolean).join("\n");
+    return [`🎯 [${state.status}] ${state.objective}`, `Usage: ${fmtCost(state.usage.cost)} · ${state.usage.turns} turns · execution ${elapsed(state)}`, state.stopReason ? `Stop reason: ${state.stopReason}` : "", state.blocker ? `Blocker: ${state.blocker}` : ""].filter(Boolean).join("\n");
   }
 
   pi.registerCommand("goal", {
@@ -777,19 +587,17 @@ export default function piGoal(pi: ExtensionAPI): void {
         const state = currentController.state;
         if (!state || state.status !== "active") throw new Error("Only an active goal can be paused.");
         await releaseRuntime(ctx, currentController, "paused by user");
-        compactionRecovery = null;
         await currentController.changeStatus("paused", "paused by user");
-        ctx.ui.notify("Goal paused. The running response finishes; /goal resume continues the goal.", "info");
+        ctx.ui.notify("Goal paused. /goal resume continues it.", "info");
         return;
       }
       if (command === "resume") {
         startupPending = false;
         const state = currentController.state;
-        if (!state || !["paused", "blocked"].includes(state.status)) throw new Error("Only a paused or blocked goal can be resumed; create a new goal with revised limits after a limit stop.");
-        compactionRecovery = null;
+        if (!state || !["paused", "blocked"].includes(state.status)) throw new Error("Only a paused or blocked goal can be resumed.");
         const resumed = await currentController.changeStatus("active", "resumed by user");
-        if (!agentCycleActive) await currentController.requestContinuation(false, continuationPrompt(resumed, false));
-        ctx.ui.notify(agentCycleActive ? "Goal resumed. The running response finishes first; the goal continues after it settles." : "Goal resumed.", "info");
+        if (!agentCycleActive) await currentController.requestContinuation(continuationPrompt(resumed));
+        ctx.ui.notify(agentCycleActive ? "Goal resumed; it continues after the running response settles." : "Goal resumed.", "info");
         return;
       }
       if (["clear", "stop", "cancel"].includes(command ?? "")) {
@@ -797,19 +605,13 @@ export default function piGoal(pi: ExtensionAPI): void {
         const state = currentController.state;
         if (!state || state.status === "cleared") { ctx.ui.notify("No active goal.", "info"); return; }
         await releaseRuntime(ctx, currentController, "cleared by user");
-        compactionRecovery = null;
         await currentController.clear("cleared by user");
         ctx.ui.notify("Goal cleared.", "info");
         return;
       }
-      const objective = raw;
       startupPending = false;
-      if (currentController.state && currentController.state.status !== "cleared") {
-        await releaseRuntime(ctx, currentController, "replaced by a new goal");
-        compactionRecovery = null;
-      }
-      const goal = await currentController.create({ objective, doneWhen: "The stated objective is verifiably satisfied.", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-      if (!agentCycleActive) await currentController.requestContinuation(false, continuationPrompt(goal, false));
+      const goal = await currentController.create({ objective: validateObjective(raw) });
+      if (!agentCycleActive) await currentController.requestContinuation(continuationPrompt(goal));
       ctx.ui.notify(`Goal started: ${goal.objective}`, "info");
     },
   });

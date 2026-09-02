@@ -1,71 +1,61 @@
 import { describe, expect, mock, test } from "bun:test";
 import { GoalController } from "./controller.ts";
-import { EVENT_ENTRY, GoalStore } from "./store.ts";
+import { GoalStore } from "./store.ts";
 
 function setup() {
   const branch: unknown[] = [];
-  const writer = { appendEntry: (_type: string, data: unknown) => branch.push({ type: "custom", customType: EVENT_ENTRY, data }) };
-  const host = { abort: mock(), sendContinuation: mock(), stateChanged: mock() };
-  const store = new GoalStore(writer, "session-1", branch);
+  const host = { sendContinuation: mock(), stateChanged: mock() };
+  const store = new GoalStore({ appendEntry(type, data) { branch.push({ type: "custom", customType: type, data }); } }, "session-1", branch);
   const controller = new GoalController(store, host, () => "2026-01-01T00:00:00.000Z");
-  return { controller, host };
+  return { branch, host, controller };
 }
 
-describe("goal controller", () => {
-  test("serializes transitions and owns continuation dispatch", async () => {
-    const { controller, host } = setup();
-    const goal = await controller.create({ objective: "ship", doneWhen: "tests pass", limits: { maxCost: null, maxTurns: 2, maxExecutionSeconds: null } });
-    const run = await controller.startRun("user", "run-1");
-    await controller.accountTurn("run-1", "turn-1", { turns: 0, inputTokens: 1, outputTokens: 2, totalTokens: 3, cost: 0.1, executionSeconds: 0 });
-    await controller.accountExecution("run-1", 4);
-    await controller.checkpoint("run-1", { action: "test", observation: "pass", progress: "made", evidence: "tests pass" });
-    await controller.endRun("run-1");
-    const dispatch = await controller.requestContinuation(false, "continue");
-    expect(goal.id).toBe(run.id);
-    expect(dispatch.runId).toBeString();
-    expect(host.sendContinuation).toHaveBeenCalledTimes(1);
-    const acknowledged = await controller.acknowledgeContinuation(dispatch.dispatchId);
-    expect(acknowledged.activeRun?.owner).toBe("continuation");
+const usage = { turns: 0, inputTokens: 10, outputTokens: 5, totalTokens: 15, cost: 0.1, executionSeconds: 0 };
+
+describe("GoalController", () => {
+  test("creates, starts, accounts, and ends a run", async () => {
+    const { controller } = setup();
+    const created = await controller.create({ objective: "ship" });
+    expect(created.status).toBe("active");
+    const started = await controller.startRun("user", "run-1");
+    expect(started.activeRun?.runId).toBe("run-1");
+    const accounted = await controller.accountTurn("run-1", "turn-1", usage);
+    expect(accounted.usage.turns).toBe(1);
+    const ended = await controller.endRun("run-1");
+    expect(ended?.activeRun).toBeUndefined();
   });
 
-  test("invalidates a pending continuation when the goal revision changes", async () => {
+  test("does not replace an unfinished goal", async () => {
     const { controller } = setup();
-    await controller.create({ objective: "ship", doneWhen: "done", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-    const dispatch = await controller.requestContinuation(false, "continue");
-    await controller.invalidateActivity("user work changed the context");
-    expect(controller.state?.pendingDispatch).toBeUndefined();
-    await expect(controller.acknowledgeContinuation(dispatch.dispatchId)).rejects.toThrow();
+    await controller.create({ objective: "first" });
+    await expect(controller.create({ objective: "second" })).rejects.toThrow("unfinished goal");
   });
 
-  test("supersedes a continuation without blocking the goal", async () => {
+  test("allows a new goal after completion", async () => {
     const { controller } = setup();
-    await controller.create({ objective: "ship", doneWhen: "done", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-    const run = await controller.startRun("user", "run-1");
-    await controller.endRun(run.activeRun!.runId);
-    const dispatch = await controller.requestContinuation(false, "continue");
-    const state = await controller.supersedeContinuation(dispatch.dispatchId, "user input arrived");
-    expect(state.status).toBe("active");
-    expect(state.pendingDispatch).toBeUndefined();
-    await expect(controller.acknowledgeContinuation(dispatch.dispatchId)).rejects.toThrow();
-  });
-
-  test("replaces a cleared goal without inheriting its event sequence", async () => {
-    const { controller } = setup();
-    const first = await controller.create({ objective: "first", doneWhen: "done", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-    await controller.clear("replace");
-    const second = await controller.create({ objective: "second", doneWhen: "done", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-    expect(second.id).not.toBe(first.id);
-    expect(second.eventSeq).toBe(1);
+    await controller.create({ objective: "first" });
+    await controller.changeStatus("complete", "completed");
+    const second = await controller.create({ objective: "second" });
     expect(second.objective).toBe("second");
+    expect(second.status).toBe("active");
   });
 
-  test("prevents completion without an exact achieved evaluation", async () => {
-    const { controller } = setup();
-    await controller.create({ objective: "ship", doneWhen: "tests pass", limits: { maxCost: null, maxTurns: null, maxExecutionSeconds: null } });
-    await expect(controller.complete()).rejects.toThrow();
-    const request = await controller.requestEvaluation();
-    await controller.recordEvaluation({ requestId: request.requestId, verdict: "achieved", reason: "verified", evidence: "tests pass" });
-    const complete = await controller.complete();
-    expect(complete.status).toBe("complete");
+  test("queues and acknowledges exactly one continuation", async () => {
+    const { controller, host } = setup();
+    await controller.create({ objective: "ship" });
+    const requested = await controller.requestContinuation("Continue the goal.");
+    expect(requested.dispatchId).toBeString();
+    expect(host.sendContinuation).toHaveBeenCalledTimes(1);
+    expect((await controller.acknowledgeContinuation(requested.dispatchId)).activeRun?.owner).toBe("continuation");
+    await expect(controller.requestContinuation("another")).rejects.toThrow("active");
+  });
+
+  test("supersedes a pending continuation without an abort host", async () => {
+    const { controller, host } = setup();
+    await controller.create({ objective: "ship" });
+    const requested = await controller.requestContinuation("Continue the goal.");
+    await controller.supersedeContinuation(requested.dispatchId, "user input");
+    expect((await controller.state)?.pendingDispatch).toBeUndefined();
+    expect(host.sendContinuation).toHaveBeenCalledTimes(1);
   });
 });

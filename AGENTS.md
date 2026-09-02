@@ -1,8 +1,8 @@
 # pi-goal
 
-Session-scoped autonomous goals for Pi. Define an objective and an explicit,
-verifiable definition of done; the supervisor drives concrete work cycles until
-completion, pause, block, limit, or clear.
+Session-scoped autonomous goals for Pi. Define one concrete objective; the
+supervisor continues it after idle provider runs until the model completes or
+blocks it.
 
 ## Architecture
 
@@ -11,22 +11,23 @@ completion, pause, block, limit, or clear.
 - Branch event store: `extensions/pi-goal/store.ts`
 - Serialized controller: `extensions/pi-goal/controller.ts`
 - Canonical state: typed `pi-goal/event` entries in the selected Pi session branch
-- Compaction checkpoint: typed `pi-goal/snapshot` entry
-- Runtime ownership: explicit run leases; never a durable authority
+- Compaction snapshot: typed `pi-goal/snapshot` entry
+- Runtime ownership: one ephemeral provider run and one queued continuation
 
 ## Scope
 
-- Goal creation requires `objective` and `doneWhen`; optional hard limits are USD cost, provider turns, and active execution seconds
-- `goal_checkpoint` owns inspect/action/observation/progress evidence; repeated no-progress or blocked cycles stop the loop
-- Completion requires a fresh read-only evaluation bound to the current revision, activity epoch, and request ID
-- No orchestration: that belongs to pi-workflows
-- No agent definitions: that belongs to pi-subagents
-- No destructive Git automation, arbitrary model-supplied shell hooks, or detached/background workflow work
-- Model-facing `update_goal` accepts only `complete` and `blocked`; user commands own pause, resume, clear, and replacement. A limit stop requires a replacement with revised limits
-- User lifecycle commands (pause, clear, replacement) never abort the running turn: they release the run lease and pending continuation, the in-flight response finishes as ordinary unaccounted work, and a still-active goal continues on the next cycle. Hard limits remain the only mid-run abort, cutting the chain at the turn boundary after the completed turn
-- Stale goal-owned continuations are aborted at `message_start` before reaching the provider; user work is never aborted
-- `cleared` is terminal and hidden from every surface (command status, tools, widget); a new goal can be created in the same session branch
-- Compatibility with the former schema, patch protocol, and project-global `.pi/goal` state is intentionally not supported
+- Goals are opt-in and should be used only for explicit, genuinely continuing work.
+- The model-facing API follows Codex: `create_goal`, `get_goal`, and
+  `update_goal` (`complete` or `blocked`).
+- `create_goal` takes one objective and fails while another goal is unfinished.
+- Completion is the model's responsibility. There is no mandatory checkpoint or
+  separate evaluator protocol.
+- User commands own pause, resume, clear, and replacement. User lifecycle
+  actions release the run without aborting the in-flight response.
+- Cleared goals are terminal and hidden from every surface. A new goal can be
+  created after a goal is cleared or completed.
+- No destructive Git automation, arbitrary model-supplied shell hooks, detached
+  workflows, or extension-level hard budgets.
 
 ## Stack and tests
 
@@ -44,23 +45,23 @@ git diff --check
 ## Tool contract
 
 | Tool | Key params | Notes |
-|------|-----------|-------|
-| `create_goal` | `objective`, `doneWhen`, optional `maxCost`, `maxTurns`, `maxExecutionSeconds` | Creates or replaces the current goal |
-| `get_goal` | (none) | Read-only structured state, limits, usage, progress, and evaluation |
-| `goal_checkpoint` | `action`, `observation`, `progress`, `evidence` | Required cycle evidence; progress is `made`, `blocked`, or `none` |
-| `evaluate_goal` | `requestId?`, `verdict?`, `reason?`, `evidence?` | Caller supplies a fresh evaluator; achieved requires evidence |
-| `update_goal` | `status: complete\|blocked`, `blocker?` | Completion requires the exact achieved evaluation |
+|------|------------|-------|
+| `create_goal` | `objective` | Explicit autonomous work only; fails for an unfinished goal |
+| `get_goal` | (none) | Read-only structured state and usage |
+| `update_goal` | `status: complete\|blocked` | Model marks terminal goal state |
 
-Statuses: `active` → `complete` | `blocked` | `limited` | `paused` | `cleared`; only paused or blocked goals resume in place.
+Statuses: `active` → `complete` | `blocked` | `paused` | `cleared`; only paused or blocked goals resume in place.
 
 ## Design rules
 
-- Domain transitions are pure and reducers reject stale run leases, revisions, and event sequences.
-- The event store is the only durable owner; replay is branch-scoped, bounded, idempotent by event ID, and snapshot-aware.
-- The controller serializes all goal mutations and external effects. Every provider dispatch has one run lease; stale lifecycle events cannot charge, continue, or abort replacement work.
-- Parent turns, nested usage, and execution time are accounted independently and idempotently. Limits are local stop conditions, not provider-plan quotas.
-- User input supersedes pending continuations. Unacknowledged continuation delivery blocks after a bounded timeout rather than leaving an active goal stranded.
-- Restart and tree reconstruction do not auto-run. Forks clear inherited goals. Compaction pauses an interrupted run, snapshots state, and resumes through one recovery continuation after success.
-- Progress checkpoints are bounded and include concrete evidence. Failed tools and prose-only cycles do not count as progress.
-- Evaluation claims are invalidated by workspace/tool activity, user steering, tree changes, compaction, replacement, and lifecycle context changes. Fresh evaluator independence is caller-enforced.
-- No compatibility shims, duplicate state authorities, Git mutation, or arbitrary shell hooks.
+- Domain transitions are pure and reject stale run leases and event sequences.
+- The event store is the only durable owner; replay is branch-scoped, bounded,
+  idempotent by event ID, and snapshot-aware.
+- The controller serializes goal mutations and continuation dispatches.
+- Parent turns and execution time are accounted independently and idempotently.
+- User input supersedes pending continuations. Unacknowledged continuation
+  delivery blocks after a bounded timeout instead of leaving an active goal stranded.
+- Restart and tree reconstruction do not auto-run. Forks clear inherited goals.
+- Compaction snapshots state and resumes through one recovery continuation after
+  successful manual compaction.
+- Former schemas are intentionally ignored rather than migrated.

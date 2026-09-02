@@ -1,13 +1,8 @@
 # pi-goal
 
-Session-scoped autonomous goals for Pi. Define an objective and an explicit
-verifiable definition of done; pi-goal drives concrete work cycles until the
-goal is complete, paused, blocked, limited, or cleared.
-
-The supervisor is built around a pure state reducer, typed events, a
-branch-aware Pi session store, and a serialized run-lease controller. It never
-mutates Git, runs arbitrary model-supplied shell hooks, or launches detached
-workflows.
+Session-scoped autonomous goals for Pi. Create a goal only when the user
+explicitly asks for autonomous, continuing work; Pi resumes it after each idle
+provider run until the model completes or blocks it.
 
 ## Installation
 
@@ -20,80 +15,52 @@ Requires Pi `>=0.81.0`.
 ## Quick start
 
 ```text
-/goal all tests pass and lint is clean
+/goal keep working until the parser tests and lint pass
 ```
 
-The command uses a default definition of done. For model-created goals, use
-both fields explicitly:
+The model can also create a goal explicitly:
 
 ```text
-create_goal({
-  "objective": "make the parser reject malformed input",
-  "doneWhen": "the focused tests and the full test suite pass"
-})
+create_goal({"objective": "make the parser reject malformed input"})
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/goal` | Show status, limits, execution time, progress, and blocker |
-| `/goal <objective>` | Start an unlimited goal (replaces an active goal without cancelling the running turn) |
-| `/goal pause` | Pause the active goal; the running response finishes, the goal stops after it |
+| `/goal` | Show the current goal and usage |
+| `/goal <objective>` | Start a goal when no unfinished goal exists |
+| `/goal pause` | Pause the goal |
 | `/goal resume` | Resume a paused or blocked goal |
-| `/goal clear` | Clear the goal; it disappears from status, tools, and the widget. `stop` and `cancel` are aliases |
+| `/goal clear` | Clear the goal (`stop` and `cancel` are aliases) |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `create_goal` | Create or replace a goal with `objective`, `doneWhen`, and optional `maxCost`, `maxTurns`, and `maxExecutionSeconds` |
-| `get_goal` | Read structured state, usage, limits, progress, and evaluation |
-| `goal_checkpoint` | Record the action, observation, progress classification, and evidence for a cycle |
-| `evaluate_goal` | Request or record a fresh read-only completion evaluation |
-| `update_goal` | Complete or block the goal |
+| `create_goal` | Create a goal with a concrete objective; fails while another goal is unfinished |
+| `get_goal` | Read the current goal, status, usage, and blocker |
+| `update_goal` | Mark the goal `complete` or `blocked` |
 
-The model-facing protocol is intentionally explicit:
+The model-facing protocol is deliberately small:
 
 ```text
-inspect → action → observation → goal_checkpoint → continue or stop
+create_goal → work → update_goal(complete|blocked)
 ```
 
-A prose-only cycle is recorded as no progress. Repeated no-progress or blocked
-cycles stop the supervisor with a concrete diagnostic.
+Completion is the model's responsibility, as it is in Codex's goal extension.
+There is no mandatory checkpoint or fake independent evaluator round-trip.
 
-## Completion and safety
+## Runtime and persistence
 
-- Completion requires a fresh, read-only evaluator to return `achieved` with
-  non-empty evidence.
-- The evaluation must match the current goal revision, activity epoch, and
-  request ID. Tool activity, user steering, tree changes, and compaction
-  invalidate stale claims.
-- Usage is recorded once per provider turn. Execution time is recorded
-  independently, in whole seconds, and may be bounded with
-  `maxExecutionSeconds`.
-- Run leases prevent stale retries, continuations, reloads, compactions, and
-  user-interrupted work from charging or controlling a replacement run.
-- User commands own pause, resume, clear, and replacement. A limit stop requires
-  creating a replacement with revised limits. The model can only complete or
-  block through `update_goal`.
-- Pause, clear, and replacement never cancel the running turn: the in-flight
-  response finishes as ordinary unaccounted work and a still-active goal
-  continues on the next cycle. Hard limits remain the only mid-run abort, at
-  the turn boundary.
-- Pi-goal does not commit, reset, clean, or execute arbitrary shell hooks.
+Goal state is stored as typed events in the selected Pi session branch and
+replayed by a pure reducer. Runtime state owns one provider run and one queued
+continuation. A user prompt supersedes a queued continuation without aborting
+the user's work. Restart reconstructs state but does not start work until user
+input or `/goal resume`; forks start without the parent goal.
 
-## Persistence and architecture
-
-Typed goal events are stored in the selected Pi session branch and replayed
-through the reducer. Compaction writes a reducer snapshot; restart reconstructs
-state but does not start work until user input or `/goal resume`. Forks clear
-inherited goals. Runtime ownership is ephemeral and is never treated as
-persistent truth.
-
-The implementation is intentionally a new schema and API. It does not import
-or migrate the former project-global `.pi/goal` format or the previous
-snapshot/patch protocol.
+The current schema and API are intentionally new. Former goal events and the
+old patch protocol are ignored rather than migrated.
 
 ## Development
 
